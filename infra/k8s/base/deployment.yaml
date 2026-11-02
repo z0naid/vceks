@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  replicas: 1 # set per environment in config.json
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    spec:
+      serviceAccountName: app
+      # Baseline: matches the "restricted" Pod Security Standard that Ops
+      # enforces on the namespace, so a pod that drops any of this is refused.
+      securityContext:
+        runAsNonRoot: true
+        # The image's user (nextjs, see Dockerfile). Kubernetes can only
+        # verify "non-root" from a number, not a user name.
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        # Spread replicas over nodes so one node going away does not take
+        # the app down.
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: app
+      # The image is built for amd64 (see deploy.yml). Change both together.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: app
+          image: app # replaced with <ecr repo>@sha256:<digest> by render.sh
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            # AWS_REGION, SERVICE_NAME and ALB_SIGNER_ARN, generated per deploy.
+            - configMapRef:
+                name: app-config
+            # The secrets listed in config.json "appSecrets", if any.
+            - secretRef:
+                name: app-secrets
+                optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          volumeMounts:
+            # The root filesystem is read-only; Next.js still needs these.
+            - name: next-cache
+              mountPath: /app/.next/cache
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: next-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

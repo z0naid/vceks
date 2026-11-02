@@ -1,0 +1,10 @@
+{
+  "appName": "REPLACE_ME",
+  "awsAccountId": "REPLACE_ME",
+  "awsRegion": "us-east-2",
+  "parameters": {
+    "GitHubOrg": "securly-engineering",
+    "GitHubRepo": "REPLACE_ME",
+    "ClusterName": "REPLACE_ME"
+  }
+}

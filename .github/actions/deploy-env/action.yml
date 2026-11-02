@@ -1,0 +1,174 @@
+name: Deploy one environment
+description: >-
+  Deploys <app>-<env>-aws (infra/app/aws.yaml) with CloudFormation, then the
+  Kubernetes manifests (infra/k8s/) into namespace <app>-<env> on the shared
+  EKS cluster, using the environment's GitHub deploy role from Template 1.
+  All non-secret settings come from infra/app/config.json.
+
+inputs:
+  environment:
+    description: staging or prod (the key in infra/app/config.json)
+    required: true
+  image-uri:
+    description: Image pinned by digest (...@sha256:...)
+    required: true
+
+outputs:
+  url:
+    description: The app's URL
+    value: ${{ steps.apply.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Load config
+      id: config
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        CFG=infra/app/config.json
+        if grep -q REPLACE_ME "$CFG"; then
+          echo "::error file=$CFG::Fill in every REPLACE_ME value before deploying."
+          exit 1
+        fi
+        APP=$(jq -r .appName "$CFG")
+        ACCOUNT=$(jq -r .awsAccountId "$CFG")
+        {
+          echo "app=$APP"
+          echo "namespace=$APP-$ENV_NAME"
+          echo "region=$(jq -r .awsRegion "$CFG")"
+          echo "cluster=$(jq -r .clusterName "$CFG")"
+          echo "deploy_role=arn:aws:iam::$ACCOUNT:role/$APP-gh-deploy-$ENV_NAME"
+          echo "cfn_role=arn:aws:iam::$ACCOUNT:role/$APP-cfn-exec"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Assume deploy role (OIDC, no keys)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ steps.config.outputs.deploy_role }}
+        aws-region: ${{ steps.config.outputs.region }}
+
+    # First, so the pod role has its permissions before new pods start.
+    - name: Deploy AWS stack
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment }}
+        APP: ${{ steps.config.outputs.app }}
+        CFN_ROLE: ${{ steps.config.outputs.cfn_role }}
+      run: |
+        set -euo pipefail
+        aws cloudformation deploy \
+          --stack-name "$APP-$ENV_NAME-aws" \
+          --template-file infra/app/aws.yaml \
+          --role-arn "$CFN_ROLE" \
+          --no-fail-on-empty-changeset \
+          --tags app="$APP" environment="$ENV_NAME" \
+          --parameter-overrides AppName="$APP" Environment="$ENV_NAME"
+
+    - name: Connect to the cluster
+      shell: bash
+      env:
+        CLUSTER: ${{ steps.config.outputs.cluster }}
+        REGION: ${{ steps.config.outputs.region }}
+      run: aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+
+    # Secret values go through files in a private temp directory, never
+    # through command-line arguments or the workspace.
+    - name: Copy secrets into the namespace
+      id: secrets
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment }}
+        APP: ${{ steps.config.outputs.app }}
+        NS: ${{ steps.config.outputs.namespace }}
+      run: |
+        set -euo pipefail
+        umask 077
+        DIR=$(mktemp -d "$RUNNER_TEMP/secrets.XXXXXX")
+
+        # Login client for the load balancer controller (Ingress secretName "oidc").
+        mkdir "$DIR/oidc"
+        jq -r --arg e "$ENV_NAME" '.environments[$e].oidc.clientId' infra/app/config.json \
+          | tr -d '\n' > "$DIR/oidc/clientID"
+        aws secretsmanager get-secret-value --secret-id "$APP/$ENV_NAME/oidc" \
+          --query SecretString --output text | jq -r .client_secret | tr -d '\n' > "$DIR/oidc/clientSecret"
+        if grep -q set-by-set-oidc-secret-workflow "$DIR/oidc/clientSecret"; then
+          echo "::error::$APP/$ENV_NAME/oidc still holds the placeholder. Run the \"Set secret\" workflow with name oidc first."
+          exit 1
+        fi
+        kubectl -n "$NS" create secret generic oidc --from-file="$DIR/oidc" \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        # App secrets listed in config.json; render.sh turns them into env vars.
+        mkdir "$DIR/app"
+        for NAME in $(jq -r '.appSecrets[]' infra/app/config.json); do
+          aws secretsmanager get-secret-value --secret-id "$APP/app/$ENV_NAME/$NAME" \
+            --query SecretString --output text > "$DIR/app/$NAME"
+        done
+        echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+    - name: Apply manifests
+      id: apply
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment }}
+        NS: ${{ steps.config.outputs.namespace }}
+        IMAGE_URI: ${{ inputs.image-uri }}
+        SECRETS_DIR: ${{ steps.secrets.outputs.dir }}
+      run: |
+        set -euo pipefail
+        HOST=$(jq -r --arg e "$ENV_NAME" '.environments[$e].host' infra/app/config.json)
+        if [ -n "$(ls -A "$SECRETS_DIR/app")" ]; then export APP_SECRETS_DIR="$SECRETS_DIR/app"; fi
+
+        # The app checks that login tokens were signed by ITS load balancer,
+        # which the controller creates, so the ARN is only known after the
+        # first apply. On that first deploy the manifests are applied twice.
+        alb_hostname() {
+          kubectl -n "$NS" get ingress app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true
+        }
+        alb_arn() {
+          local h; h=$(alb_hostname)
+          [ -n "$h" ] || return 0
+          aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?DNSName=='$h'].LoadBalancerArn | [0]" --output text | grep -v '^None$' || true
+        }
+        apply() {
+          infra/k8s/render.sh "$ENV_NAME" "$IMAGE_URI" "$1" > "$RUNNER_TEMP/manifests.yaml"
+          kubectl apply -f "$RUNNER_TEMP/manifests.yaml"
+        }
+
+        ARN=$(alb_arn)
+        apply "$ARN"
+        if [ -z "$ARN" ]; then
+          echo "Waiting for the load balancer (first deploy)..."
+          for _ in $(seq 60); do
+            ARN=$(alb_arn)
+            [ -n "$ARN" ] && break
+            sleep 10
+          done
+          if [ -z "$ARN" ]; then
+            kubectl -n "$NS" describe ingress app || true
+            echo "::error::No load balancer after 10 minutes. The Ingress events above say why."
+            exit 1
+          fi
+          apply "$ARN"
+        fi
+        rm -rf "$SECRETS_DIR" infra/k8s/.out
+
+        kubectl -n "$NS" rollout status deployment/app --timeout=10m
+
+        if [ -n "$HOST" ]; then URL="https://$HOST"; else URL="https://$(alb_hostname)"; fi
+        echo "url=$URL" >> "$GITHUB_OUTPUT"
+        {
+          echo "### $ENV_NAME deployed"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| App | $URL |"
+          echo "| Who am I | $URL/whoami |"
+          echo "| Health | $URL/api/health |"
+          echo "| Namespace | \`$NS\` |"
+          echo "| Image | \`$IMAGE_URI\` |"
+        } >> "$GITHUB_STEP_SUMMARY"

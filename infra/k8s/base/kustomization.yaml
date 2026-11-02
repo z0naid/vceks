@@ -1,0 +1,17 @@
+# TEMPLATE 2 (Kubernetes part) - developer-owned. The same manifests run in
+# both environments; render.sh adds the per-environment values from
+# infra/app/config.json (namespace, image digest, replicas, load balancer
+# settings). Nothing here names the namespace: the deploy role can only
+# write to <app>-<env> anyway.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+labels:
+  - pairs:
+      app.kubernetes.io/name: app
+    includeSelectors: true
+resources:
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - networkpolicy.yaml

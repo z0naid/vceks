@@ -1,0 +1,68 @@
+# Deliberately breaks the Kubernetes baseline (policy.py), one rule per
+# document. CI checks that every document is rejected.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: kind-not-allowed }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: service-of-type-loadbalancer }
+spec: { type: LoadBalancer, ports: [{ port: 80 }] }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-open-to-the-world
+  annotations:
+    alb.ingress.kubernetes.io/auth-type: oidc
+    alb.ingress.kubernetes.io/inbound-cidrs: 0.0.0.0/0
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-2:123456789012:certificate/x
+spec: { ingressClassName: alb }
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ingress-without-login
+  annotations:
+    alb.ingress.kubernetes.io/inbound-cidrs: 10.0.0.0/8
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-2:123456789012:certificate/x
+spec: { ingressClassName: alb }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: deployment-running-as-root }
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: example.invalid/app@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: { limits: { memory: 512Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: deployment-with-host-network }
+spec:
+  template:
+    spec:
+      hostNetwork: true
+      securityContext: { runAsNonRoot: true }
+      containers:
+        - name: app
+          image: example.invalid/app@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: { limits: { memory: 512Mi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: deployment-with-mutable-image-tag }
+spec:
+  template:
+    spec:
+      securityContext: { runAsNonRoot: true }
+      containers:
+        - name: app
+          image: example.invalid/app:latest
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: { limits: { memory: 512Mi } }

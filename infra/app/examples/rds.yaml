@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  EXAMPLE - PostgreSQL on RDS with the baseline defaults. Copy into aws.yaml
+  (or deploy as its own <app>-<env>-db stack) when the app needs a database.
+
+# Before this can deploy, Template 1 must grant CfnExecRole the rds:* actions
+# it uses (an Ops review), because the database is a new service for the app.
+#
+# Baseline defaults (see infra/README.md):
+#   - StorageEncrypted: true. Encryption cannot be added to an existing
+#     instance later without a snapshot-and-restore, so it starts on.
+#   - PubliclyAccessible: false, in private subnets only, reachable only from
+#     the app's pods.
+#   - No password in the template or the app: RDS manages the master password
+#     in Secrets Manager, and the app connects with IAM database auth.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The cluster's VPC (from Ops).
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The cluster's private subnets (from Ops).
+  ClientSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      The security group the app's pods use, the only allowed client. On Auto
+      Mode that is the cluster security group, shared by every pod on the
+      cluster; use security groups for pods to narrow it to this app.
+  InstanceClass:
+    Type: String
+    Default: db.t4g.micro
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${AppName}-${Environment} private subnets
+      SubnetIds: !Ref PrivateSubnetIds
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AppName}-${Environment} database, app pods only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ClientSecurityGroupId
+      # A database starts no outbound connections. Without an explicit rule
+      # the group would get the default allow-all egress, so this placeholder
+      # (loopback only) replaces it.
+      SecurityGroupEgress:
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32, Description: no egress }
+
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${AppName}-${Environment}
+      Engine: postgres
+      EngineVersion: "18"
+      DBInstanceClass: !Ref InstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      MasterUsername: app_admin
+      ManageMasterUserPassword: true
+      # The app's pod role gets rds-db:connect (allowed by the workload
+      # boundary) instead of a password.
+      EnableIAMDatabaseAuthentication: true
+      MultiAZ: !If [IsProd, true, false]
+      BackupRetentionPeriod: !If [IsProd, 14, 3]
+      DeletionProtection: !If [IsProd, true, false]
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      # RDS for PostgreSQL 15+ already defaults rds.force_ssl to 1, so
+      # connections without TLS are refused.
+
+Outputs:
+  Endpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  MasterSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn

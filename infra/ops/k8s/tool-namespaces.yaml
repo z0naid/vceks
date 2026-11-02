@@ -1,0 +1,32 @@
+# OPS ONLY - once per tool, with cluster-admin. Replace __APP__ with the app
+# name and apply:
+#
+#   sed 's/__APP__/<app>/g' infra/ops/k8s/tool-namespaces.yaml | kubectl apply -f -
+#
+# Namespaces are cluster-wide objects, so a tool's deploy role (which has
+# "edit" inside its namespace only) cannot create them or change these
+# labels. That is what makes the labels a real control:
+#   - pod-security "restricted": the cluster refuses pods that run as root,
+#     escalate privileges, use host namespaces or keep Linux capabilities.
+#   - pod-readiness-gate-inject: the load balancer controller holds a rollout
+#     until new pods are healthy in the target group, so deploys drop no
+#     requests.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __APP__-staging
+  labels:
+    app: __APP__
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    elbv2.k8s.aws/pod-readiness-gate-inject: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: __APP__-prod
+  labels:
+    app: __APP__
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    elbv2.k8s.aws/pod-readiness-gate-inject: enabled

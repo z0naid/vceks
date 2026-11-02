@@ -1,0 +1,30 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  OPS ONLY - run once per AWS account by Ops, as stack account-github-oidc.
+  Creates the GitHub Actions OIDC provider that every tool's deploy roles
+  trust. Kept out of any tool's stacks so deleting one tool cannot cut off
+  every other tool's pipeline.
+
+# Other one-time account settings that have no CloudFormation resource, for
+# Ops to apply by hand (see infra/README.md):
+#   aws ec2 enable-ebs-encryption-by-default          (per region)
+#   SCP or explicit Deny protecting role/*-instance from admin edits
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    # Every tool's pipeline depends on this; never lose it to a stack mistake.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      # AWS no longer checks these for GitHub, but older accounts still require
+      # the list to be present.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+Outputs:
+  GitHubOidcProviderArn:
+    Value: !Ref GitHubOidcProvider

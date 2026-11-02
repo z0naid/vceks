@@ -1,0 +1,499 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  TEMPLATE 1 of 2 - security stack for one app on the shared EKS cluster.
+  Reviewed and deployed by Ops, rarely: on project creation, or when the app
+  needs a new AWS service. Holds every IAM role, the permissions boundary, the
+  ECR repository, the login client secrets and the app's access to the
+  cluster. Everything else lives in Template 2 (infra/app/ and infra/k8s/),
+  which developers deploy through GitHub Actions without review. Needs the
+  account's GitHub OIDC provider (infra/ops/account.yaml) and the tool's
+  namespaces (infra/ops/k8s/tool-namespaces.yaml) to exist first.
+
+# Trust chain - how "changes only through the pipeline" is enforced:
+#
+#   GitHub Actions --(OIDC, no keys)--> <app>-gh-deploy-{staging,prod}
+#       AWS: push/pull this app's ECR repo, run change sets on this app's one
+#       CloudFormation stack per environment, iam:PassRole exactly one role
+#       (<app>-cfn-exec), read and write this app's secrets.
+#       Kubernetes: "edit" in namespace <app>-<env> ONLY (EKS access entry
+#       below). Cannot touch other namespaces, cluster-wide objects, RBAC or
+#       the namespace itself (its Pod Security labels are set by Ops).
+#   CloudFormation --(assumes)--> <app>-cfn-exec
+#       May only write inline policies on <app>-app-* roles that carry the
+#       <app>-workload-boundary permissions boundary, and manage this app's
+#       secrets. It cannot create roles at all.
+#   Pods --(EKS Pod Identity)--> <app>-app-<env>-pod
+#       Created here with the boundary and no permissions. Template 2 adds its
+#       permissions (infra/app/aws.yaml), so developers can refine least
+#       privilege without Ops; the boundary is the ceiling Ops reviews once.
+#
+# Baseline rules followed throughout (see infra/README.md):
+#   - Least privilege; no "<service>:*" or "*" actions. Resource "*" appears
+#     only where the action has no resource-level support (each is commented).
+#   - The production deploy role trusts only the GitHub "production"
+#     environment, which has required reviewers.
+
+Parameters:
+  AppName:
+    Type: String
+    # 20 chars max so "<app>-staging" stays a short namespace and role name.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+    Description: Short app id. Prefixes every stack, role, repo, secret and namespace.
+  GitHubOrg:
+    Type: String
+    Default: securly-engineering
+  GitHubRepo:
+    Type: String
+    Description: Repository name only, without the org.
+  ClusterName:
+    Type: String
+    Description: The shared EKS cluster the app runs on (owned by Ops).
+
+Resources:
+  # ---- image registry -------------------------------------------------------
+
+  Repository:
+    Type: AWS::ECR::Repository
+    # Images are what production runs; never lose them to a stack mistake.
+    # Except on create: if the very first deploy rolls back, the empty repo
+    # is removed too, so a retry is not blocked by "repository exists".
+    DeletionPolicy: RetainExceptOnCreate
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref AppName
+      # Immutable tags: a pushed commit SHA can never be overwritten, so the
+      # digest staging tested is the digest production promotes.
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 50 images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":50},
+            "action":{"type":"expire"}}]}
+
+  # ---- login client secrets -------------------------------------------------
+  # Used by the load balancer's OIDC login, never by the app. The deploy job
+  # copies the value into a Kubernetes Secret in the app's namespace, where
+  # the AWS Load Balancer Controller reads it. The real value is written by
+  # the "Set secret" workflow from a GitHub environment secret - no one pastes
+  # it into a console. CloudFormation only rewrites the value if this
+  # placeholder text changes, so leave it alone.
+
+  OidcSecretStaging:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AppName}/staging/oidc
+      Description: OIDC client secret used by the staging load balancer.
+      SecretString: '{"client_secret":"set-by-set-oidc-secret-workflow"}'
+
+  OidcSecretProd:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AppName}/prod/oidc
+      Description: OIDC client secret used by the production load balancer.
+      SecretString: '{"client_secret":"set-by-set-oidc-secret-workflow"}'
+
+  # ---- permissions boundary for the app's pod roles --------------------------
+  # This is the ceiling. Grant a pod role something not listed here and the
+  # call is denied at runtime, whatever the role's own policy says. Adding a
+  # new AWS service for the app means adding it here, which is an Ops review.
+
+  WorkloadBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AppName}-workload-boundary
+      Description: Maximum permissions for any role this app's pods use.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OwnMetrics
+            Effect: Allow
+            Action: cloudwatch:PutMetricData
+            # PutMetricData has no resource-level support; scoped by namespace.
+            Resource: "*"
+            Condition:
+              StringEquals: { cloudwatch:namespace: !Ref AppName }
+          - Sid: OwnAppSecrets
+            Effect: Allow
+            Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+            Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/app/*
+          - Sid: OwnParameters
+            Effect: Allow
+            Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/*
+          - Sid: DecryptOnlyThroughSecretsAndParameters
+            Effect: Allow
+            Action: kms:Decrypt
+            Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+            Condition:
+              StringEquals:
+                kms:ViaService:
+                  - !Sub secretsmanager.${AWS::Region}.amazonaws.com
+                  - !Sub ssm.${AWS::Region}.amazonaws.com
+          - Sid: OwnBuckets
+            Effect: Allow
+            Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+            Resource: !Sub arn:aws:s3:::${AppName}-*/*
+          - Sid: OwnBucketListing
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${AppName}-*
+          - Sid: DatabaseIamAuth
+            Effect: Allow
+            # IAM database auth instead of passwords in env vars. Narrow the
+            # db-resource-id and user name in the app's own role policy.
+            Action: rds-db:connect
+            Resource: !Sub arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:*/*
+
+  # ---- pod roles ---------------------------------------------------------------
+  # One per environment, with no permissions of its own: infra/app/aws.yaml
+  # (Template 2) writes them. The trust policy only accepts EKS Pod Identity
+  # sessions from this cluster, for the "app" service account in this app's
+  # namespace, so another namespace cannot borrow the role even if it were
+  # associated there by mistake.
+
+  PodRoleStaging:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-app-staging-pod
+      PermissionsBoundary: !Ref WorkloadBoundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:RequestTag/kubernetes-namespace: !Sub ${AppName}-staging
+                aws:RequestTag/kubernetes-service-account: app
+              ArnEquals:
+                aws:SourceArn: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+
+  PodRoleProd:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-app-prod-pod
+      PermissionsBoundary: !Ref WorkloadBoundary
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: pods.eks.amazonaws.com }
+            Action: [sts:AssumeRole, sts:TagSession]
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:RequestTag/kubernetes-namespace: !Sub ${AppName}-prod
+                aws:RequestTag/kubernetes-service-account: app
+              ArnEquals:
+                aws:SourceArn: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+
+  PodIdentityStaging:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: !Sub ${AppName}-staging
+      ServiceAccount: app
+      RoleArn: !GetAtt PodRoleStaging.Arn
+
+  PodIdentityProd:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: !Sub ${AppName}-prod
+      ServiceAccount: app
+      RoleArn: !GetAtt PodRoleProd.Arn
+
+  # ---- CloudFormation execution role ----------------------------------------
+  # Used for infra/app/aws.yaml and anything copied from infra/app/examples/.
+  # The examples need more (rds, elasticache, security groups); Ops adds those
+  # actions here when an app asks for them.
+
+  CfnExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-cfn-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - !Ref CfnExecPolicy
+
+  CfnExecPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AppName}-cfn-exec
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: WritePodRolePermissions
+            Effect: Allow
+            # Inline policies only, and only on roles that carry the boundary,
+            # so whatever is written is still capped by it.
+            Action: [iam:PutRolePolicy, iam:DeleteRolePolicy]
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-app-*
+            Condition:
+              StringEquals: { iam:PermissionsBoundary: !Ref WorkloadBoundary }
+          - Sid: ReadPodRoles
+            Effect: Allow
+            Action: [iam:GetRole, iam:GetRolePolicy, iam:ListRolePolicies]
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-app-*
+          - Sid: NeverRemoveOrWeakenTheBoundary
+            Effect: Deny
+            Action:
+              - iam:DeleteRolePermissionsBoundary
+              - iam:PutRolePermissionsBoundary
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicy
+              - iam:DeletePolicyVersion
+              - iam:SetDefaultPolicyVersion
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+              - !Ref WorkloadBoundary
+          - Sid: OwnAppSecrets
+            Effect: Allow
+            # Template 2 may declare its own secrets under <app>/app/<env>/.
+            # Values are written by the "Set secret" workflow or generated.
+            Action:
+              - secretsmanager:CreateSecret
+              - secretsmanager:DeleteSecret
+              - secretsmanager:UpdateSecret
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DescribeSecret
+              - secretsmanager:TagResource
+              - secretsmanager:UntagResource
+            Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/app/*
+          - Sid: GeneratedSecretValues
+            Effect: Allow
+            # For GenerateSecretString. No resource-level support.
+            Action: secretsmanager:GetRandomPassword
+            Resource: "*"
+
+  # ---- GitHub deploy roles --------------------------------------------------
+  # Trust: the OIDC "sub" claim must name this repo AND the GitHub environment.
+  # Two forms are accepted because GitHub can issue either, depending on the
+  # org's OIDC settings: "repo:org/repo:..." and the immutable-ID form
+  # "repo:org@<id>/repo@<id>:...". An org name cannot contain "@", so the
+  # wildcard cannot match another org's repo.
+
+  DeployRoleStaging:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-gh-deploy-staging
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:staging
+                  - !Sub repo:${GitHubOrg}@*/${GitHubRepo}@*:environment:staging
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                # GetAuthorizationToken has no resource-level support.
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushOwnImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+              - Sid: OwnStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-staging-aws/*
+              - Sid: TemplateChecks
+                Effect: Allow
+                # No resource-level support.
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: HandOverToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: cloudformation.amazonaws.com }
+              - Sid: ConnectToCluster
+                Effect: Allow
+                # For "aws eks update-kubeconfig". What the role may do inside
+                # the cluster is set by AccessStaging below, not by IAM.
+                Action: eks:DescribeCluster
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+              - Sid: FindOwnLoadBalancer
+                Effect: Allow
+                # The controller creates the load balancer; the deploy looks up
+                # its ARN to tell the app which signer to trust. Read only, and
+                # Describe has no resource-level support.
+                Action: elasticloadbalancing:DescribeLoadBalancers
+                Resource: "*"
+              - Sid: OwnLoginSecret
+                Effect: Allow
+                # Write: the "Set secret" workflow. Read: the deploy copies it
+                # into the namespace for the load balancer controller.
+                Action: [secretsmanager:PutSecretValue, secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Ref OidcSecretStaging
+              - Sid: OwnAppSecretValues
+                Effect: Allow
+                # Write: "Set secret". Read: the deploy copies the names listed
+                # in infra/app/config.json into the namespace.
+                Action: [secretsmanager:PutSecretValue, secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/app/staging/*
+
+  # Same as staging except: trusts only the "production" environment, touches
+  # only -prod resources, and pulls but never pushes images, because
+  # production promotes the exact digest staging already ran.
+  DeployRoleProd:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-gh-deploy-prod
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:production
+                  - !Sub repo:${GitHubOrg}@*/${GitHubRepo}@*:environment:production
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: VerifyPromotedImage
+                Effect: Allow
+                Action: [ecr:DescribeImages, ecr:BatchGetImage]
+                Resource: !GetAtt Repository.Arn
+              - Sid: OwnStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-prod-aws/*
+              - Sid: TemplateChecks
+                Effect: Allow
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: HandOverToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: cloudformation.amazonaws.com }
+              - Sid: ConnectToCluster
+                Effect: Allow
+                Action: eks:DescribeCluster
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+              - Sid: FindOwnLoadBalancer
+                Effect: Allow
+                Action: elasticloadbalancing:DescribeLoadBalancers
+                Resource: "*"
+              - Sid: OwnLoginSecret
+                Effect: Allow
+                Action: [secretsmanager:PutSecretValue, secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Ref OidcSecretProd
+              - Sid: OwnAppSecretValues
+                Effect: Allow
+                Action: [secretsmanager:PutSecretValue, secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/app/prod/*
+
+  # ---- access to the cluster ----------------------------------------------------
+  # The Kubernetes half of least privilege. AmazonEKSEditPolicy is the
+  # built-in "edit" role: Deployments, Services, Ingresses, Secrets,
+  # NetworkPolicies and the like, in the one namespace only. It cannot change
+  # RBAC, the namespace's labels, or anything cluster-wide.
+
+  AccessStaging:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref ClusterName
+      PrincipalArn: !GetAtt DeployRoleStaging.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy
+          AccessScope:
+            Type: namespace
+            Namespaces: [!Sub "${AppName}-staging"]
+
+  AccessProd:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref ClusterName
+      PrincipalArn: !GetAtt DeployRoleProd.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy
+          AccessScope:
+            Type: namespace
+            Namespaces: [!Sub "${AppName}-prod"]
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+  WorkloadBoundaryArn:
+    Value: !Ref WorkloadBoundary
+  CfnExecRoleArn:
+    Value: !GetAtt CfnExecRole.Arn
+  DeployRoleStagingArn:
+    Description: Assumed by the GitHub "staging" environment.
+    Value: !GetAtt DeployRoleStaging.Arn
+  DeployRoleProdArn:
+    Description: Assumed by the GitHub "production" environment.
+    Value: !GetAtt DeployRoleProd.Arn
+  PodRoleStagingArn:
+    Value: !GetAtt PodRoleStaging.Arn
+  PodRoleProdArn:
+    Value: !GetAtt PodRoleProd.Arn
+  OidcSecretStagingName:
+    Value: !Sub ${AppName}/staging/oidc
+  OidcSecretProdName:
+    Value: !Sub ${AppName}/prod/oidc

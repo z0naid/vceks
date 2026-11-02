@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  SANDBOX ONLY - Cognito stand-in for the company identity provider, used to
+  rehearse the login flow. In a real account this is replaced by the company
+  SSO: only the four endpoint URLs, the client id and the client secret in
+  infra/app/config.json change. Not deployed by any workflow.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  DomainPrefix:
+    Type: String
+    Description: Globally unique per region; may not contain aws, amazon or cognito.
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Default: https://localhost/oauth2/idpresponse
+    Description: >-
+      Comma-separated https://<alb dns name>/oauth2/idpresponse, one per
+      environment. Use the placeholder for the first deploy, then redeploy
+      with the real addresses once the app exists.
+  TestUserEmail:
+    Type: String
+    Default: ""
+    Description: If set, Cognito emails this address a temporary password.
+
+Conditions:
+  HasTestUser: !Not [!Equals [!Ref TestUserEmail, ""]]
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AppName}-sandbox
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      # No self sign-up: anyone reaching the login page could otherwise make
+      # an account and walk into the app.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref DomainPrefix
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AppName}-alb
+      # The ALB authenticates as a confidential client, so it needs a secret.
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: !Ref CallbackUrls
+
+  TestUser:
+    Type: AWS::Cognito::UserPoolUser
+    Condition: HasTestUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: !Ref TestUserEmail
+      DesiredDeliveryMediums: [EMAIL]
+      UserAttributes:
+        - { Name: email, Value: !Ref TestUserEmail }
+        - { Name: email_verified, Value: "true" }
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  ClientId:
+    Description: OidcClientId in infra/app/config.json
+    Value: !Ref UserPoolClient
+  Issuer:
+    Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+  AuthorizationEndpoint:
+    Value: !Sub https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize
+  TokenEndpoint:
+    Value: !Sub https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/token
+  UserInfoEndpoint:
+    Value: !Sub https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/userInfo

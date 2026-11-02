@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  OPS ONLY - run by Ops with admin credentials, once per tool, as stack
+  <app>-ops-deployer. Creates <app>-security-deployer, the role the "Security
+  stack" workflow assumes. Not deployed by any workflow in this repo, on
+  purpose: a repo must not be able to widen the permissions of the role that
+  deploys its own security stack. Needs infra/ops/account.yaml first, and the
+  tool's namespaces (infra/ops/k8s/tool-namespaces.yaml).
+
+# The role trusts ONLY the GitHub "security" environment of this one repo,
+# and that environment requires Ops approval. It can manage only resources
+# named <app>-* / <app>/*, so it cannot touch other tools' roles.
+#
+# Set the variable SECURITY_DEPLOY_ROLE_ARN on the "security" GitHub
+# environment to the SecurityDeployerRoleArn output.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  GitHubOrg:
+    Type: String
+  GitHubRepo:
+    Type: String
+  ClusterName:
+    Type: String
+    Description: The shared EKS cluster the tool runs on.
+
+Resources:
+  SecurityDeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-security-deployer
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:security
+                  - !Sub repo:${GitHubOrg}@*/${GitHubRepo}@*:environment:security
+      Policies:
+        - PolicyName: deploy-security-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: OwnStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplateSummary
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-security/*
+              - Sid: TemplateChecks
+                Effect: Allow
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: OwnRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:PutRolePermissionsBoundary
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-*
+              - Sid: OwnPolicies
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:TagPolicy
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:policy/${AppName}-*
+              # The only grant of iam:AttachRolePolicy; IAM unions Allow
+              # statements, so an unconditioned grant elsewhere would void this
+              # condition. This narrows managed-policy attachment only: the
+              # role can still write inline policies (security.yaml needs to),
+              # so the real control on this role is Ops approval of the
+              # "security" environment.
+              - Sid: AttachOnlyOwnPolicies
+                Effect: Allow
+                Action: iam:AttachRolePolicy
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-*
+                Condition:
+                  ArnLike:
+                    iam:PolicyARN: !Sub arn:aws:iam::${AWS::AccountId}:policy/${AppName}-*
+              - Sid: PassRoleToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-*
+                Condition:
+                  StringEquals: { iam:PassedToService: cloudformation.amazonaws.com }
+              - Sid: PassPodRolesToEks
+                Effect: Allow
+                # Pod Identity associations check iam:PassRole on the pod role.
+                # Unconditioned because that check may not carry an
+                # iam:PassedToService value (as with instance profiles), and a
+                # failed first deploy is costly. Limited to the pod roles.
+                Action: iam:PassRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-app-*-pod
+              - Sid: ReadCluster
+                Effect: Allow
+                Action: eks:DescribeCluster
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+              - Sid: CreateClusterLinks
+                Effect: Allow
+                # The new entry or association has no ARN until it exists. What
+                # it may grant is limited by the statements below.
+                Action:
+                  - eks:CreateAccessEntry
+                  - eks:CreatePodIdentityAssociation
+                  - eks:ListPodIdentityAssociations
+                  - eks:TagResource
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${ClusterName}
+              - Sid: OwnAccessEntries
+                Effect: Allow
+                # Access entries are named after the role they are for, so
+                # this only reaches the tool's own <app>-* roles.
+                Action:
+                  - eks:DescribeAccessEntry
+                  - eks:UpdateAccessEntry
+                  - eks:DeleteAccessEntry
+                  - eks:ListAssociatedAccessPolicies
+                  - eks:DisassociateAccessPolicy
+                  - eks:TagResource
+                  - eks:UntagResource
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:access-entry/${ClusterName}/role/${AWS::AccountId}/${AppName}-*
+              - Sid: OnlyEditInOwnNamespaces
+                Effect: Allow
+                # The one Kubernetes permission a tool may hand out: "edit",
+                # scoped to its own namespaces. Never cluster-wide, never admin.
+                Action: eks:AssociateAccessPolicy
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:access-entry/${ClusterName}/role/${AWS::AccountId}/${AppName}-*
+                Condition:
+                  StringEquals:
+                    eks:policyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy
+                    eks:accessScope: namespace
+                  ForAllValues:StringLike:
+                    eks:namespaces: !Sub ${AppName}-*
+              - Sid: NoKubernetesGroups
+                Effect: Deny
+                # Groups map to whatever RBAC the cluster binds to them, which
+                # could be far more than "edit". Tools never need them.
+                Action: [eks:CreateAccessEntry, eks:UpdateAccessEntry]
+                Resource: "*"
+                Condition:
+                  "Null": { eks:kubernetesGroups: "false" }
+              - Sid: OwnPodIdentityAssociations
+                Effect: Allow
+                # Associations have random ids, so they are scoped by the
+                # app tag the workflow puts on the stack (and so on them).
+                Action:
+                  - eks:UpdatePodIdentityAssociation
+                  - eks:DeletePodIdentityAssociation
+                  - eks:UntagResource
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:podidentityassociation/${ClusterName}/*
+                Condition:
+                  StringEquals: { aws:ResourceTag/app: !Ref AppName }
+              - Sid: ReadAndTagPodIdentityAssociations
+                Effect: Allow
+                # Tagging happens as part of the create, before the app tag
+                # exists, so it cannot be tag-scoped. Known gap: this role
+                # could re-tag another tool's association. Ops approval of
+                # every run of this role is the control.
+                Action: [eks:DescribePodIdentityAssociation, eks:TagResource]
+                Resource: !Sub arn:aws:eks:${AWS::Region}:${AWS::AccountId}:podidentityassociation/${ClusterName}/*
+              - Sid: OwnRepository
+                Effect: Allow
+                Action:
+                  - ecr:CreateRepository
+                  - ecr:DeleteRepository
+                  - ecr:DescribeRepositories
+                  - ecr:PutImageTagMutability
+                  - ecr:PutImageScanningConfiguration
+                  - ecr:PutLifecyclePolicy
+                  - ecr:DeleteLifecyclePolicy
+                  - ecr:GetLifecyclePolicy
+                  - ecr:TagResource
+                  - ecr:ListTagsForResource
+                  - ecr:SetRepositoryPolicy
+                  - ecr:GetRepositoryPolicy
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${AppName}
+              - Sid: OwnSecrets
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:TagResource
+                  - secretsmanager:GetResourcePolicy
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/*
+
+Outputs:
+  SecurityDeployerRoleArn:
+    Description: Set as SECURITY_DEPLOY_ROLE_ARN on the GitHub "security" environment.
+    Value: !GetAtt SecurityDeployerRole.Arn

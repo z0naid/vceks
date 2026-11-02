@@ -1,0 +1,143 @@
+name: Deploy
+
+# Template 2 pipeline. Build the image once, deploy it to staging, then
+# promote the SAME digest to production after approval. Production never
+# rebuilds, so what was tested on staging is byte for byte what runs in prod.
+#
+# GitHub setup this relies on (see infra/README.md):
+#   - environment "staging"     (no reviewers needed)
+#   - environment "production"  (required reviewers; this approval is what
+#                                gates access to production AWS credentials)
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "infra/security/**"
+      - "infra/guard/**"
+      - "infra/ops/**"
+  workflow_dispatch:
+
+permissions:
+  id-token: write # AWS OIDC
+  contents: read
+
+# One deploy at a time; a newer push waits rather than racing the older one.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build and push image
+    needs: checks
+    # The template repo itself has nothing to deploy; repos created from it
+    # are not templates, so this only skips here.
+    if: ${{ !github.event.repository.is_template }}
+    runs-on: ubuntu-latest
+    environment: staging # the only role allowed to push
+    outputs:
+      image: ${{ steps.image.outputs.uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load config
+        id: config
+        run: |
+          set -euo pipefail
+          CFG=infra/app/config.json
+          if grep -q REPLACE_ME "$CFG"; then
+            echo "::error file=$CFG::Fill in every REPLACE_ME value before deploying."
+            exit 1
+          fi
+          APP=$(jq -r .appName "$CFG")
+          {
+            echo "app=$APP"
+            echo "region=$(jq -r .awsRegion "$CFG")"
+            echo "role=arn:aws:iam::$(jq -r .awsAccountId "$CFG"):role/$APP-gh-deploy-staging"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ steps.config.outputs.role }}
+          aws-region: ${{ steps.config.outputs.region }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tags are immutable, so a re-run of the same commit reuses the image
+      # instead of failing on push.
+      - name: Check for existing image
+        id: existing
+        env:
+          APP: ${{ steps.config.outputs.app }}
+        run: |
+          DIGEST=$(aws ecr describe-images --repository-name "$APP" \
+            --image-ids imageTag="$GITHUB_SHA" \
+            --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)
+          if [ -n "$DIGEST" ] && [ "$DIGEST" != "None" ]; then
+            echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Buildx
+        if: steps.existing.outputs.digest == ''
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (linux/amd64)
+        id: build
+        if: steps.existing.outputs.digest == ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Native on GitHub's runners, and the most common node type. Must
+          # match the nodeSelector in infra/k8s/base/deployment.yaml.
+          platforms: linux/amd64
+          push: true
+          # A single-platform manifest, so the digest the pods run is the digest
+          # we promote (attestations would wrap it in an index).
+          provenance: false
+          tags: ${{ steps.ecr.outputs.registry }}/${{ steps.config.outputs.app }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image reference
+        id: image
+        env:
+          REPO: ${{ steps.ecr.outputs.registry }}/${{ steps.config.outputs.app }}
+          DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+        run: echo "uri=$REPO@$DIGEST" >> "$GITHUB_OUTPUT"
+
+  staging:
+    name: Deploy staging
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: deploy
+        uses: ./.github/actions/deploy-env
+        with:
+          environment: staging
+          image-uri: ${{ needs.build.outputs.image }}
+
+  production:
+    name: Promote to production
+    needs: [build, staging]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: deploy
+        uses: ./.github/actions/deploy-env
+        with:
+          environment: prod
+          image-uri: ${{ needs.build.outputs.image }}

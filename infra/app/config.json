@@ -1,0 +1,37 @@
+{
+  "appName": "REPLACE_ME",
+  "awsAccountId": "REPLACE_ME",
+  "awsRegion": "us-east-2",
+  "clusterName": "REPLACE_ME",
+  "appSecrets": [],
+  "environments": {
+    "staging": {
+      "replicas": 1,
+      "host": "",
+      "scheme": "internet-facing",
+      "certificateArn": "REPLACE_ME",
+      "ingressCidrs": ["REPLACE_ME"],
+      "oidc": {
+        "issuer": "REPLACE_ME",
+        "authorizationEndpoint": "REPLACE_ME",
+        "tokenEndpoint": "REPLACE_ME",
+        "userInfoEndpoint": "REPLACE_ME",
+        "clientId": "REPLACE_ME"
+      }
+    },
+    "prod": {
+      "replicas": 2,
+      "host": "",
+      "scheme": "internet-facing",
+      "certificateArn": "REPLACE_ME",
+      "ingressCidrs": ["REPLACE_ME"],
+      "oidc": {
+        "issuer": "REPLACE_ME",
+        "authorizationEndpoint": "REPLACE_ME",
+        "tokenEndpoint": "REPLACE_ME",
+        "userInfoEndpoint": "REPLACE_ME",
+        "clientId": "REPLACE_ME"
+      }
+    }
+  }
+}

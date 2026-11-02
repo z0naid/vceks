@@ -1,0 +1,31 @@
+# Deliberately breaks the Template 2 rules (see violates-baseline.yaml).
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  RoleInApp:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: myapp-app-staging-extra
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Principal: { Service: pods.eks.amazonaws.com }, Action: sts:AssumeRole }
+  ManagedPolicyInApp:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Action: s3:GetObject, Resource: "*" }
+  RolePolicyOnAnotherRole:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: { "Fn::Sub": "${AppName}-cfn-exec" }
+      PolicyName: app
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Action: s3:GetObject, Resource: "*" }
+  EcsServiceInApp:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: x

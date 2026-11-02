@@ -1,0 +1,25 @@
+# OPS ONLY - once per cluster, and only for an EKS Auto Mode cluster such as
+# sandbox-eks.yaml. A cluster running the AWS Load Balancer Controller
+# itself already has an "alb" IngressClass and does not need this.
+#
+#   kubectl apply -f infra/ops/k8s/cluster.yaml
+#
+# Every tool's Ingress uses ingressClassName "alb"; this points that name at
+# Auto Mode's built-in load balancer controller.
+apiVersion: eks.amazonaws.com/v1
+kind: IngressClassParams
+metadata:
+  name: alb
+spec:
+  scheme: internet-facing
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb
+spec:
+  controller: eks.amazonaws.com/alb
+  parameters:
+    apiGroup: eks.amazonaws.com
+    kind: IngressClassParams
+    name: alb

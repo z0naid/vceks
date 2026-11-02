@@ -1,0 +1,51 @@
+# Deliberately breaks the baseline. CI runs baseline.guard against each
+# resource here on its own and fails the build if any of them PASSES - that is
+# how we know the rules still catch what they claim to.
+AWSTemplateFormatVersion: "2010-09-09"
+Resources:
+  WildcardAction:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - { Effect: Allow, Action: "s3:*", Resource: "*" }
+  OpenIngress:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: open to the world
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }
+  OpenEgress:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: all egress
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+  ImdsV1:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions: { HttpTokens: optional }
+  UnencryptedDb:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      StorageEncrypted: false
+      PubliclyAccessible: false
+  PublicDb:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: postgres
+      StorageEncrypted: true
+      PubliclyAccessible: true
+  UnencryptedCache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: plain
+      AtRestEncryptionEnabled: false
+      TransitEncryptionEnabled: false
+  LongLivedKey:
+    Type: AWS::IAM::User

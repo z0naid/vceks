@@ -1,0 +1,40 @@
+#
+# Extra rules for Template 2's CloudFormation (infra/app/**) only. The
+# Kubernetes half of Template 2 is checked by infra/k8s/policy.py.
+# CfnExecRole in Template 1 enforces the same things at deploy time; these
+# rules catch them at pull-request time, with a readable message.
+#
+
+# Roles, their boundary and their trust live in Template 1. Template 2 may
+# only add permissions to the app's pod roles, as AWS::IAM::RolePolicy.
+let app_iam = Resources.*[
+    Type in ['AWS::IAM::Role', 'AWS::IAM::ManagedPolicy', 'AWS::IAM::Policy',
+             'AWS::IAM::User', 'AWS::IAM::Group', 'AWS::IAM::AccessKey',
+             'AWS::IAM::InstanceProfile', 'AWS::IAM::OIDCProvider']
+]
+
+rule app_no_iam_except_role_policies {
+    %app_iam empty
+    <<Template 2 may only use AWS::IAM::RolePolicy on the <app>-app-<env>-pod role; roles are created in Template 1.>>
+}
+
+# Explicit Deny statements are fine; this is about what is granted. The
+# boundary caps it anyway, but a wildcard here usually means the author
+# did not know what the app needs.
+let role_policies = Resources.*[ Type == 'AWS::IAM::RolePolicy' ]
+
+rule app_role_policies_name_the_pod_role when %role_policies !empty {
+    %role_policies.Properties.RoleName.'Fn::Sub' == /^\$\{AppName\}-app-/
+    <<RolePolicy must target !Sub ${AppName}-app-${Environment}-pod.>>
+}
+
+# Kubernetes owns the workload now; no ECS or EC2 compute in Template 2.
+let compute = Resources.*[
+    Type in ['AWS::ECS::Service', 'AWS::ECS::TaskDefinition', 'AWS::EC2::Instance',
+             'AWS::EC2::LaunchTemplate', 'AWS::AutoScaling::AutoScalingGroup']
+]
+
+rule app_no_compute {
+    %compute empty
+    <<Run the workload on the cluster (infra/k8s/), not as ECS or EC2 resources.>>
+}

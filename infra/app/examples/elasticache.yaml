@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  EXAMPLE - Redis-compatible cache on ElastiCache with the baseline defaults.
+  Copy into aws.yaml (or deploy as its own <app>-<env>-cache stack).
+
+# Before this can deploy, Template 1 must grant CfnExecRole the elasticache
+# actions it uses (an Ops review).
+#
+# Baseline defaults (see infra/README.md):
+#   - Encrypted at rest and in transit, with TLS required for every client.
+#     Neither can be switched on later without replacing the cluster.
+#   - Private subnets only, reachable only from the app's pods.
+#     ElastiCache has no public endpoint option at all; the subnet group is
+#     what keeps it private.
+#   - A replication group, never AWS::ElastiCache::CacheCluster, which cannot
+#     encrypt.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The cluster's VPC (from Ops).
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The cluster's private subnets (from Ops).
+  ClientSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      The security group the app's pods use, the only allowed client. On Auto
+      Mode that is the cluster security group, shared by every pod on the
+      cluster; use security groups for pods to narrow it to this app.
+  NodeType:
+    Type: String
+    Default: cache.t4g.micro
+
+Resources:
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub ${AppName}-${Environment} private subnets
+      SubnetIds: !Ref PrivateSubnetIds
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AppName}-${Environment} cache, app pods only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref ClientSecurityGroupId
+      # Replaces the default allow-all egress; a cache starts no connections.
+      SecurityGroupEgress:
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32, Description: no egress }
+
+
+  Cache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${AppName}-${Environment}
+      ReplicationGroupDescription: !Sub ${AppName}-${Environment} cache
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: !Ref NodeType
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      TransitEncryptionMode: required
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!Ref CacheSecurityGroup]
+      # For authentication beyond network isolation, add a UserGroupIds entry
+      # with IAM-authenticated users rather than a shared AuthToken.
+
+Outputs:
+  PrimaryEndpoint:
+    Value: !GetAtt Cache.PrimaryEndPoint.Address

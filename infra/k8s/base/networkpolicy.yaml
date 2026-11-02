@@ -1,0 +1,30 @@
+# Same idea as the ECS version's security groups: in on the app port only,
+# out on 443 (AWS APIs, the load balancer's signing keys), DNS, and the Pod
+# Identity agent. Only enforced if network policy is enabled on the cluster
+# (an Ops setting); harmless otherwise.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: app
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - port: 3000
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+      ports:
+        - port: 80
+          protocol: TCP

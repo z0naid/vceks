@@ -1,0 +1,44 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  TEMPLATE 2 (AWS part) - the AWS resources one environment of the app owns,
+  deployed as <app>-<env>-aws before the Kubernetes manifests (infra/k8s/).
+  Developer-owned: change it in a pull request, no Ops review needed.
+
+# What belongs here: the pod role's permissions, the app's own secrets, and
+# anything copied from examples/ (a database, a cache). The pod role itself,
+# its boundary and its link to the cluster are in Template 1, so nothing here
+# can grant more than <app>-workload-boundary allows.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+
+Resources:
+  # Least privilege for the app's pods. Add a statement when the app starts
+  # using something new; if it is outside the boundary the call is denied at
+  # runtime and the boundary needs an Ops change first.
+  PodPermissions:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Sub ${AppName}-app-${Environment}-pod
+      PolicyName: app
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OwnAppSecrets
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/app/${Environment}/*
+
+  # Example app secret. Declare it here, list its name under "appSecrets" in
+  # config.json, set its value with the "Set secret" workflow, and the deploy
+  # passes it to the container as an environment variable of the same name.
+  # DatabaseUrlSecret:
+  #   Type: AWS::SecretsManager::Secret
+  #   Properties:
+  #     Name: !Sub ${AppName}/app/${Environment}/DATABASE_URL
+  #     Description: Set by the "Set secret" workflow.

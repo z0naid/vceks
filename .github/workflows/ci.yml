@@ -1,0 +1,135 @@
+name: Checks
+
+# Runs on every pull request, and is called by the deploy workflows so
+# nothing reaches AWS without passing the same checks.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: App lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  infra:
+    name: Template lint and baseline rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cfn-lint and cfn-guard
+        run: |
+          pip install --quiet cfn-lint==1.59.0
+          curl -sSfL -o guard.tgz \
+            https://github.com/aws-cloudformation/cloudformation-guard/releases/download/3.2.1/cfn-guard-v3-x86_64-ubuntu-latest.tar.gz
+          tar xzf guard.tgz
+          sudo install "$(find . -type f -name cfn-guard | head -1)" /usr/local/bin/cfn-guard
+          cfn-guard --version
+
+      - name: cfn-lint
+        run: cfn-lint infra/security/*.yaml infra/app/*.yaml infra/app/examples/*.yaml infra/ops/*.yaml
+
+      # One file at a time so config.json and READMEs are never fed to guard.
+      - name: Company baseline (all templates)
+        run: |
+          set -euo pipefail
+          for f in infra/security/*.yaml infra/app/*.yaml infra/app/examples/*.yaml infra/ops/*.yaml; do
+            echo "::group::$f"
+            cfn-guard validate --rules infra/guard/baseline.guard --data "$f" --show-summary fail
+            echo "::endgroup::"
+          done
+
+      - name: Template 2 rules (developer-owned templates)
+        run: |
+          set -euo pipefail
+          for f in infra/app/*.yaml infra/app/examples/*.yaml; do
+            echo "::group::$f"
+            cfn-guard validate --rules infra/guard/app.guard --data "$f" --show-summary fail
+            echo "::endgroup::"
+          done
+
+      # Each resource in the violates-*.yaml files breaks one rule. Checked one
+      # resource at a time, so a rule that silently stopped matching shows up
+      # as MISSED instead of being hidden by the others.
+      - name: Rules still catch violations
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys, yaml
+          missed = 0
+          for rules, data in [("infra/guard/baseline.guard", "infra/guard/tests/violates-baseline.yaml"),
+                              ("infra/guard/app.guard", "infra/guard/tests/violates-app.yaml")]:
+              for name, resource in yaml.safe_load(open(data))["Resources"].items():
+                  path = f"/tmp/{name}.json"
+                  json.dump({"Resources": {name: resource}}, open(path, "w"))
+                  rc = subprocess.run(["cfn-guard", "validate", "--rules", rules, "--data", path,
+                                       "--show-summary", "none"], capture_output=True).returncode
+                  print(("caught " if rc else "MISSED ") + f"{name}  ({rules})")
+                  missed += rc == 0
+          sys.exit(1 if missed else 0)
+          PY
+
+      - name: Config files agree
+        run: |
+          set -euo pipefail
+          for k in appName awsAccountId awsRegion; do
+            a=$(jq -r ".$k" infra/security/config.json)
+            b=$(jq -r ".$k" infra/app/config.json)
+            if [ "$a" != "$b" ]; then
+              echo "::error::$k differs: infra/security/config.json=$a, infra/app/config.json=$b"
+              exit 1
+            fi
+          done
+          a=$(jq -r .parameters.ClusterName infra/security/config.json)
+          b=$(jq -r .clusterName infra/app/config.json)
+          if [ "$a" != "$b" ]; then
+            echo "::error::Cluster differs: infra/security/config.json=$a, infra/app/config.json=$b"
+            exit 1
+          fi
+
+  k8s:
+    name: Kubernetes manifests and baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # kubectl (with kustomize) and jq come with GitHub's Ubuntu runners.
+      - name: Install kubeconform and PyYAML
+        run: |
+          pip install --quiet pyyaml==6.0.2
+          curl -sSfL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz             | tar xz kubeconform
+          sudo install kubeconform /usr/local/bin/kubeconform
+
+      # The checks run on exactly what render.sh would deploy, per environment.
+      - name: Render, validate and check the baseline
+        run: |
+          set -euo pipefail
+          for env in staging prod; do
+            echo "::group::$env"
+            infra/k8s/render.sh "$env" > "/tmp/$env.yaml"
+            kubeconform -strict -summary "/tmp/$env.yaml"
+            python infra/k8s/policy.py "/tmp/$env.yaml"
+            echo "::endgroup::"
+          done
+
+      - name: Baseline still catches violations
+        run: python infra/k8s/policy.py --each-fails infra/k8s/tests/violates.yaml

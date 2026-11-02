@@ -1,0 +1,26 @@
+# Ops reviews what can widen permissions; the team owns everything else.
+# Enforced only when branch protection on main has "Require review from Code
+# Owners" turned on.
+#
+# REPLACE the team handles below with the real GitHub teams.
+
+# Default: the app team.
+*                       @securly-engineering/vibe-city
+
+# Template 1 (roles, boundary, ECR, secrets) - Ops.
+/infra/security/        @securly-engineering/devops
+
+# The baseline rules. Weakening them would let anything through review.
+/infra/guard/           @securly-engineering/devops
+/infra/k8s/policy.py    @securly-engineering/devops
+/infra/k8s/tests/       @securly-engineering/devops
+/infra/k8s/render.sh    @securly-engineering/devops
+
+# Cluster and account setup that Ops runs by hand.
+/infra/ops/             @securly-engineering/devops
+
+# Workflows decide which checks run and which roles are assumed, so they
+# could bypass both of the above.
+/.github/workflows/     @securly-engineering/devops
+/.github/actions/       @securly-engineering/devops
+/.github/CODEOWNERS     @securly-engineering/devops
