@@ -1,36 +1,36 @@
 {
-  "appName": "REPLACE_ME",
-  "awsAccountId": "REPLACE_ME",
+  "appName": "vceks",
+  "awsAccountId": "345594602909",
   "awsRegion": "us-east-2",
-  "clusterName": "REPLACE_ME",
+  "clusterName": "sandbox",
   "appSecrets": [],
   "environments": {
     "staging": {
       "replicas": 1,
       "host": "",
       "scheme": "internet-facing",
-      "certificateArn": "REPLACE_ME",
-      "ingressCidrs": ["REPLACE_ME"],
+      "certificateArn": "arn:aws:acm:us-east-2:345594602909:certificate/2a402cea-3313-422b-958e-22b5831c99a8",
+      "ingressCidrs": ["103.153.66.241/32"],
       "oidc": {
-        "issuer": "REPLACE_ME",
-        "authorizationEndpoint": "REPLACE_ME",
-        "tokenEndpoint": "REPLACE_ME",
-        "userInfoEndpoint": "REPLACE_ME",
-        "clientId": "REPLACE_ME"
+        "issuer": "https://cognito-idp.us-east-2.amazonaws.com/us-east-2_w6Vsa2WAQ",
+        "authorizationEndpoint": "https://vceks-345594602909.auth.us-east-2.amazoncognito.com/oauth2/authorize",
+        "tokenEndpoint": "https://vceks-345594602909.auth.us-east-2.amazoncognito.com/oauth2/token",
+        "userInfoEndpoint": "https://vceks-345594602909.auth.us-east-2.amazoncognito.com/oauth2/userInfo",
+        "clientId": "1jjhntaf1j6ta7vjv6khkf4431"
       }
     },
     "prod": {
       "replicas": 2,
       "host": "",
       "scheme": "internet-facing",
-      "certificateArn": "REPLACE_ME",
-      "ingressCidrs": ["REPLACE_ME"],
+      "certificateArn": "arn:aws:acm:us-east-2:345594602909:certificate/2a402cea-3313-422b-958e-22b5831c99a8",
+      "ingressCidrs": ["103.153.66.241/32"],
       "oidc": {
-        "issuer": "REPLACE_ME",
-        "authorizationEndpoint": "REPLACE_ME",
-        "tokenEndpoint": "REPLACE_ME",
-        "userInfoEndpoint": "REPLACE_ME",
-        "clientId": "REPLACE_ME"
+        "issuer": "https://cognito-idp.us-east-2.amazonaws.com/us-east-2_w6Vsa2WAQ",
+        "authorizationEndpoint": "https://vceks-345594602909.auth.us-east-2.amazoncognito.com/oauth2/authorize",
+        "tokenEndpoint": "https://vceks-345594602909.auth.us-east-2.amazoncognito.com/oauth2/token",
+        "userInfoEndpoint": "https://vceks-345594602909.auth.us-east-2.amazoncognito.com/oauth2/userInfo",
+        "clientId": "1jjhntaf1j6ta7vjv6khkf4431"
       }
     }
   }
