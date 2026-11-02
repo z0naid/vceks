@@ -1,0 +1,132 @@
+name: Security stack
+
+# Template 1 pipeline. Deploys infra/security/security.yaml as <app>-security.
+# Rare by design: only on project creation or when the app needs a new AWS
+# service. Changes to infra/security/ need an Ops review (CODEOWNERS), and the
+# deploy job waits for Ops approval on the "security" environment.
+#
+# GitHub setup this relies on (see infra/README.md):
+#   - environment "security" with required reviewers from Ops
+#   - environment variable SECURITY_DEPLOY_ROLE_ARN on it: a role Ops owns
+#     that may create IAM roles. It is deliberately NOT defined in this repo,
+#     so this repo cannot widen its own permissions.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/security/**"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: security-stack
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Change set and deploy (Ops approval)
+    needs: checks
+    runs-on: ubuntu-latest
+    environment: security
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load config
+        id: config
+        run: |
+          set -euo pipefail
+          CFG=infra/security/config.json
+          if grep -q REPLACE_ME "$CFG"; then
+            echo "::error file=$CFG::Fill in every REPLACE_ME value before deploying."
+            exit 1
+          fi
+          {
+            echo "app=$(jq -r .appName "$CFG")"
+            echo "region=$(jq -r .awsRegion "$CFG")"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.SECURITY_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ steps.config.outputs.region }}
+
+      # A change set rather than "deploy", so the exact resource changes are
+      # written to the job summary before anything is executed.
+      - name: Create change set
+        id: changeset
+        env:
+          APP: ${{ steps.config.outputs.app }}
+        run: |
+          set -euo pipefail
+          STACK="$APP-security"
+          NAME="gh-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+            TYPE=UPDATE
+          else
+            TYPE=CREATE
+          fi
+          mapfile -t PARAMS < <(jq -r \
+            '.parameters | to_entries[] | "ParameterKey=\(.key),ParameterValue=\(.value)"' \
+            infra/security/config.json)
+          aws cloudformation create-change-set \
+            --stack-name "$STACK" --change-set-name "$NAME" --change-set-type "$TYPE" \
+            --template-body file://infra/security/security.yaml \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --tags Key=app,Value="$APP" \
+            --parameters ParameterKey=AppName,ParameterValue="$APP" "${PARAMS[@]}" >/dev/null
+
+          if ! aws cloudformation wait change-set-create-complete --stack-name "$STACK" --change-set-name "$NAME"; then
+            REASON=$(aws cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$NAME" \
+              --query StatusReason --output text)
+            if echo "$REASON" | grep -q "didn't contain changes"; then
+              echo "No changes."
+              aws cloudformation delete-change-set --stack-name "$STACK" --change-set-name "$NAME"
+              echo "changes=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::error::$REASON"
+            exit 1
+          fi
+
+          {
+            echo "### Security stack change set ($TYPE)"
+            echo '```'
+            aws cloudformation describe-change-set --stack-name "$STACK" --change-set-name "$NAME" \
+              --query 'Changes[].ResourceChange.[Action,LogicalResourceId,ResourceType,Replacement]' \
+              --output table
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "changes=true"
+            echo "stack=$STACK"
+            echo "name=$NAME"
+            echo "type=$TYPE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Execute change set
+        if: steps.changeset.outputs.changes == 'true'
+        env:
+          STACK: ${{ steps.changeset.outputs.stack }}
+          NAME: ${{ steps.changeset.outputs.name }}
+          TYPE: ${{ steps.changeset.outputs.type }}
+        run: |
+          set -euo pipefail
+          aws cloudformation execute-change-set --stack-name "$STACK" --change-set-name "$NAME"
+          if [ "$TYPE" = CREATE ]; then
+            aws cloudformation wait stack-create-complete --stack-name "$STACK"
+          else
+            aws cloudformation wait stack-update-complete --stack-name "$STACK"
+          fi
+          {
+            echo "### Outputs"
+            echo '```'
+            aws cloudformation describe-stacks --stack-name "$STACK" \
+              --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output table
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,443 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  TEMPLATE 2 (part 1 of 2) - network for one app environment. Deployed by
+  GitHub Actions as <app>-<env>-network before <app>-<env>-app. Two public
+  subnets for the load balancer, two private subnets for everything else.
+
+# Baseline defaults in this file (see infra/README.md). Each one can be
+# changed for a specific deployment, but say why in the pull request:
+#   - NACL denies 22/tcp and 3389/tcp from 0.0.0.0/0 on every subnet. SSH and
+#     RDP are replaced by SSM Session Manager, which needs no inbound port.
+#   - Nothing runs in a public subnet except the load balancer.
+#   - Who may reach the load balancer is an explicit list of CIDRs (the
+#     IngressPrefixList below), never 0.0.0.0/0.
+#
+# If several apps should later share one network, deploy this once and point
+# each app stack's NetworkStack parameter at it.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    AllowedPattern: "^(\\d{1,3}\\.){3}\\d{1,3}/16$"
+    Description: A /16. Split into four /24 subnets.
+  HighAvailabilityNat:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >-
+      One NAT gateway per AZ (true) or one shared NAT (false, about $32/month
+      cheaper). With one NAT, losing its AZ cuts private outbound traffic.
+  # Who may reach the load balancer. Typically the corporate VPN egress
+  # range. The pattern rejects 0.0.0.0/0 so "open to the world" cannot happen
+  # by accident; a genuinely public tool needs a reviewed template change.
+  IngressCidr1:
+    Type: String
+    AllowedPattern: "^(?!0\\.0\\.0\\.0/0$)(\\d{1,3}\\.){3}\\d{1,3}/(\\d|[12]\\d|3[0-2])$"
+    ConstraintDescription: Must be an IPv4 CIDR other than 0.0.0.0/0.
+  IngressCidr2:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(?!0\\.0\\.0\\.0/0$)(\\d{1,3}\\.){3}\\d{1,3}/(\\d|[12]\\d|3[0-2])$"
+  IngressCidr3:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(?!0\\.0\\.0\\.0/0$)(\\d{1,3}\\.){3}\\d{1,3}/(\\d|[12]\\d|3[0-2])$"
+  IngressCidr4:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^(?!0\\.0\\.0\\.0/0$)(\\d{1,3}\\.){3}\\d{1,3}/(\\d|[12]\\d|3[0-2])$"
+
+Conditions:
+  TwoNats: !Equals [!Ref HighAvailabilityNat, "true"]
+  HasCidr2: !Not [!Equals [!Ref IngressCidr2, ""]]
+  HasCidr3: !Not [!Equals [!Ref IngressCidr3, ""]]
+  HasCidr4: !Not [!Equals [!Ref IngressCidr4, ""]]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}" }
+
+  # ---- subnets --------------------------------------------------------------
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      # No automatic public IPs, even here. Only the load balancer and NAT
+      # gateway live in public subnets, and both get addresses explicitly.
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-public-a" }
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-public-b" }
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-private-a" }
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-private-b" }
+
+  # ---- internet and NAT -----------------------------------------------------
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}" }
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-public" }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private tasks still need outbound HTTPS: ECR image layers, and the load
+  # balancer's public signing key that the app fetches to verify logins.
+  NatAddressA:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatAddressA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-a" }
+
+  NatAddressB:
+    Type: AWS::EC2::EIP
+    Condition: TwoNats
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Condition: TwoNats
+    Properties:
+      AllocationId: !GetAtt NatAddressB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-b" }
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-private-a" }
+
+  PrivateDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-private-b" }
+
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [TwoNats, !Ref NatGatewayB, !Ref NatGatewayA]
+
+  PrivateSubnetARoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateSubnetBRoutes:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # Free, and keeps ECR image layer downloads (served from S3) off the NAT.
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB]
+
+  # ---- network ACLs ---------------------------------------------------------
+  # NACLs are stateless and evaluated lowest rule number first, so the SSH/RDP
+  # denies sit at 10 and 20, ahead of every allow. That ordering matters:
+  # 3389 falls inside the 1024-65535 return-traffic range allowed below.
+
+  PublicNacl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-public" }
+
+  PublicNaclDenySsh:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNacl
+      RuleNumber: 10
+      Egress: false
+      Protocol: 6
+      RuleAction: deny
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 22, To: 22 }
+
+  PublicNaclDenyRdp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNacl
+      RuleNumber: 20
+      Egress: false
+      Protocol: 6
+      RuleAction: deny
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 3389, To: 3389 }
+
+  # The load balancer security group does the real filtering by source CIDR.
+  # The NACL only has to let HTTP/HTTPS and return traffic through.
+  PublicNaclAllowHttp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNacl
+      RuleNumber: 100
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 80, To: 80 }
+
+  PublicNaclAllowHttps:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNacl
+      RuleNumber: 110
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 443, To: 443 }
+
+  PublicNaclAllowReturnTraffic:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNacl
+      RuleNumber: 120
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 1024, To: 65535 }
+
+  PublicNaclAllowFromVpc:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNacl
+      RuleNumber: 130
+      Egress: false
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: !Ref VpcCidr
+
+  PublicNaclAllowOut:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PublicNacl
+      RuleNumber: 100
+      Egress: true
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+
+  PrivateNacl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}-private" }
+
+  PrivateNaclDenySsh:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNacl
+      RuleNumber: 10
+      Egress: false
+      Protocol: 6
+      RuleAction: deny
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 22, To: 22 }
+
+  PrivateNaclDenyRdp:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNacl
+      RuleNumber: 20
+      Egress: false
+      Protocol: 6
+      RuleAction: deny
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 3389, To: 3389 }
+
+  # Private subnets accept new connections only from inside the VPC (the load
+  # balancer), plus return traffic for their own outbound calls via NAT.
+  PrivateNaclAllowFromVpc:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNacl
+      RuleNumber: 100
+      Egress: false
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: !Ref VpcCidr
+
+  PrivateNaclAllowReturnTraffic:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNacl
+      RuleNumber: 110
+      Egress: false
+      Protocol: 6
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+      PortRange: { From: 1024, To: 65535 }
+
+  PrivateNaclAllowOut:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref PrivateNacl
+      RuleNumber: 100
+      Egress: true
+      Protocol: -1
+      RuleAction: allow
+      CidrBlock: 0.0.0.0/0
+
+  PublicSubnetANacl:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      NetworkAclId: !Ref PublicNacl
+
+  PublicSubnetBNacl:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      NetworkAclId: !Ref PublicNacl
+
+  PrivateSubnetANacl:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      NetworkAclId: !Ref PrivateNacl
+
+  PrivateSubnetBNacl:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      NetworkAclId: !Ref PrivateNacl
+
+  # ---- who may reach the load balancer --------------------------------------
+
+  IngressPrefixList:
+    Type: AWS::EC2::PrefixList
+    Properties:
+      PrefixListName: !Sub ${AppName}-${Environment}-ingress
+      AddressFamily: IPv4
+      MaxEntries: 10
+      Entries:
+        - { Cidr: !Ref IngressCidr1, Description: ingress 1 }
+        - !If [HasCidr2, { Cidr: !Ref IngressCidr2, Description: ingress 2 }, !Ref AWS::NoValue]
+        - !If [HasCidr3, { Cidr: !Ref IngressCidr3, Description: ingress 3 }, !Ref AWS::NoValue]
+        - !If [HasCidr4, { Cidr: !Ref IngressCidr4, Description: ingress 4 }, !Ref AWS::NoValue]
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  VpcCidr:
+    Value: !Ref VpcCidr
+    Export: { Name: !Sub "${AWS::StackName}-VpcCidr" }
+  PublicSubnetIds:
+    Value: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export: { Name: !Sub "${AWS::StackName}-PublicSubnetIds" }
+  PrivateSubnetIds:
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+    Export: { Name: !Sub "${AWS::StackName}-PrivateSubnetIds" }
+  IngressPrefixListId:
+    Value: !Ref IngressPrefixList
+    Export: { Name: !Sub "${AWS::StackName}-IngressPrefixListId" }

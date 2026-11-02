@@ -1,0 +1,45 @@
+{
+  "appName": "REPLACE_ME",
+  "awsAccountId": "REPLACE_ME",
+  "awsRegion": "us-east-2",
+  "environments": {
+    "staging": {
+      "network": {
+        "VpcCidr": "10.20.0.0/16",
+        "HighAvailabilityNat": "false",
+        "IngressCidr1": "REPLACE_ME"
+      },
+      "app": {
+        "DomainName": "REPLACE_ME",
+        "HostedZoneId": "REPLACE_ME",
+        "DesiredCount": "1",
+        "TaskCpu": "256",
+        "TaskMemory": "512",
+        "OidcIssuer": "REPLACE_ME",
+        "OidcAuthorizationEndpoint": "REPLACE_ME",
+        "OidcTokenEndpoint": "REPLACE_ME",
+        "OidcUserInfoEndpoint": "REPLACE_ME",
+        "OidcClientId": "REPLACE_ME"
+      }
+    },
+    "prod": {
+      "network": {
+        "VpcCidr": "10.30.0.0/16",
+        "HighAvailabilityNat": "true",
+        "IngressCidr1": "REPLACE_ME"
+      },
+      "app": {
+        "DomainName": "REPLACE_ME",
+        "HostedZoneId": "REPLACE_ME",
+        "DesiredCount": "2",
+        "TaskCpu": "256",
+        "TaskMemory": "512",
+        "OidcIssuer": "REPLACE_ME",
+        "OidcAuthorizationEndpoint": "REPLACE_ME",
+        "OidcTokenEndpoint": "REPLACE_ME",
+        "OidcUserInfoEndpoint": "REPLACE_ME",
+        "OidcClientId": "REPLACE_ME"
+      }
+    }
+  }
+}

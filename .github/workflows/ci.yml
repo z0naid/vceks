@@ -1,0 +1,77 @@
+name: Checks
+
+# Runs on every pull request, and is called by the deploy workflows so
+# nothing reaches AWS without passing the same checks.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: App lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  infra:
+    name: Template lint and baseline rules
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cfn-lint and cfn-guard
+        run: |
+          pip install --quiet cfn-lint==1.59.0
+          curl -sSfL -o guard.tgz \
+            https://github.com/aws-cloudformation/cloudformation-guard/releases/download/3.2.1/cfn-guard-v3-x86_64-ubuntu-latest.tar.gz
+          tar xzf guard.tgz
+          sudo install "$(find . -type f -name cfn-guard | head -1)" /usr/local/bin/cfn-guard
+          cfn-guard --version
+
+      - name: cfn-lint
+        run: cfn-lint infra/security/*.yaml infra/app/*.yaml infra/app/examples/*.yaml
+
+      # One file at a time so config.json and READMEs are never fed to guard.
+      - name: Company baseline (all templates)
+        run: |
+          set -euo pipefail
+          for f in infra/security/*.yaml infra/app/*.yaml infra/app/examples/*.yaml; do
+            echo "::group::$f"
+            cfn-guard validate --rules infra/guard/baseline.guard --data "$f" --show-summary fail
+            echo "::endgroup::"
+          done
+
+      - name: Template 2 rules (developer-owned templates)
+        run: |
+          set -euo pipefail
+          for f in infra/app/*.yaml infra/app/examples/*.yaml; do
+            echo "::group::$f"
+            cfn-guard validate --rules infra/guard/app.guard --data "$f" --show-summary fail
+            echo "::endgroup::"
+          done
+
+      - name: Config files agree
+        run: |
+          set -euo pipefail
+          for k in appName awsAccountId awsRegion; do
+            a=$(jq -r ".$k" infra/security/config.json)
+            b=$(jq -r ".$k" infra/app/config.json)
+            if [ "$a" != "$b" ]; then
+              echo "::error::$k differs: infra/security/config.json=$a, infra/app/config.json=$b"
+              exit 1
+            fi
+          done

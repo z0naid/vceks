@@ -1,0 +1,757 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  TEMPLATE 1 of 2 - security stack for one app. Reviewed and deployed by Ops,
+  rarely: on project creation, or when the app needs a new AWS service. Holds
+  every IAM role, the permissions boundary, the ECR repository, the GitHub OIDC
+  trust and the login client secrets. Everything else lives in Template 2
+  (infra/app/), which developers deploy through GitHub Actions without review.
+
+# Trust chain - how "changes only through CloudFormation" is enforced:
+#
+#   GitHub Actions --(OIDC, no keys)--> <app>-gh-deploy-{staging,prod}
+#       Can: push/pull this app's ECR repo, run change sets on this app's
+#       stacks, iam:PassRole exactly one role (<app>-cfn-exec), and write this
+#       app's login secret. Cannot create or change any resource itself.
+#   CloudFormation --(assumes)--> <app>-cfn-exec
+#       Holds the real resource permissions. Only CloudFormation can assume it.
+#       May create IAM roles ONLY named <app>-app-* and ONLY with the
+#       <app>-workload-boundary permissions boundary attached (see below).
+#
+# Why roles are allowed in Template 2 at all: least privilege means task roles
+# change as the app changes (a new bucket, database auth). Routing every such
+# change through Ops would stall the team. The permissions boundary is the
+# ceiling Ops reviews once; any role the app creates can never exceed it, and
+# the boundary grants no IAM, STS or Organizations actions, so a created role
+# cannot be used to escalate.
+#
+# Baseline rules followed throughout (see infra/README.md):
+#   - Least privilege; no "<service>:*" or "*" actions. Resource "*" appears
+#     only where the action has no resource-level support (each is commented).
+#   - The production deploy role trusts only the GitHub "production"
+#     environment, which has required reviewers.
+
+Parameters:
+  AppName:
+    Type: String
+    # 20 chars max so "<app>-staging" still fits the 32-char ALB and target
+    # group name limits in Template 2.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+    Description: Short app id. Prefixes every stack, role, repo and secret.
+  GitHubOrg:
+    Type: String
+    Default: securly-engineering
+  GitHubRepo:
+    Type: String
+    Description: Repository name only, without the org.
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: >-
+      Route 53 zone the app's DNS record and certificate validation go into.
+      Leave empty only for a sandbox without a domain.
+  CreateGitHubOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: >-
+      The GitHub OIDC provider is one per account. Set true only for the first
+      app bootstrapped into the account.
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateGitHubOidcProvider, "true"]
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+
+Resources:
+  # ---- GitHub trust ---------------------------------------------------------
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      # AWS no longer checks these for GitHub, but older accounts still require
+      # the list to be present.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ---- image registry -------------------------------------------------------
+
+  Repository:
+    Type: AWS::ECR::Repository
+    # Images are what production runs; never lose them to a stack mistake.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref AppName
+      # Immutable tags: a pushed commit SHA can never be overwritten, so the
+      # digest staging tested is the digest production promotes.
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EncryptionConfiguration: { EncryptionType: AES256 }
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"keep last 50 images",
+            "selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":50},
+            "action":{"type":"expire"}}]}
+
+  # ---- login client secrets -------------------------------------------------
+  # Held by the load balancer's authenticate-oidc action, never by the app.
+  # Created here with a placeholder because Template 2 reads the secret at
+  # deploy time, so it must exist first. The real value is written by the
+  # "Set OIDC client secret" workflow from a GitHub environment secret - no one
+  # pastes it into a console. CloudFormation only rewrites the value if this
+  # placeholder text changes, so leave it alone.
+
+  OidcSecretStaging:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AppName}/staging/oidc
+      Description: OIDC client secret used by the staging load balancer.
+      SecretString: '{"client_secret":"set-by-set-oidc-secret-workflow"}'
+
+  OidcSecretProd:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AppName}/prod/oidc
+      Description: OIDC client secret used by the production load balancer.
+      SecretString: '{"client_secret":"set-by-set-oidc-secret-workflow"}'
+
+  # ---- permissions boundary for every role Template 2 creates ----------------
+  # This is the ceiling. Grant an app role something not listed here and the
+  # call is denied at runtime, whatever the role's own policy says. Adding a
+  # new AWS service for the app means adding it here, which is an Ops review.
+
+  WorkloadBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AppName}-workload-boundary
+      Description: Maximum permissions for any role this app creates.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OwnLogs
+            Effect: Allow
+            Action: [logs:CreateLogStream, logs:PutLogEvents]
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${AppName}/*
+          - Sid: OwnMetrics
+            Effect: Allow
+            Action: cloudwatch:PutMetricData
+            # PutMetricData has no resource-level support; scoped by namespace.
+            Resource: "*"
+            Condition:
+              StringEquals: { cloudwatch:namespace: !Ref AppName }
+          - Sid: OwnAppSecrets
+            Effect: Allow
+            Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+            Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/app/*
+          - Sid: OwnParameters
+            Effect: Allow
+            Action: [ssm:GetParameter, ssm:GetParameters, ssm:GetParametersByPath]
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AppName}/*
+          - Sid: DecryptOnlyThroughSecretsAndParameters
+            Effect: Allow
+            Action: kms:Decrypt
+            Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+            Condition:
+              StringEquals:
+                kms:ViaService:
+                  - !Sub secretsmanager.${AWS::Region}.amazonaws.com
+                  - !Sub ssm.${AWS::Region}.amazonaws.com
+          - Sid: OwnBuckets
+            Effect: Allow
+            Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+            Resource: !Sub arn:aws:s3:::${AppName}-*/*
+          - Sid: OwnBucketListing
+            Effect: Allow
+            Action: s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${AppName}-*
+          - Sid: DatabaseIamAuth
+            Effect: Allow
+            # IAM database auth instead of passwords in env vars. Narrow the
+            # db-resource-id and user name in the app's own role policy.
+            Action: rds-db:connect
+            Resource: !Sub arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:*/*
+          - Sid: EcsExecSessions
+            Effect: Allow
+            # Session Manager channel for ECS Exec, the replacement for SSH.
+            # Has no resource-level support. Only used if the service enables
+            # EnableExecuteCommand.
+            Action:
+              - ssmmessages:CreateControlChannel
+              - ssmmessages:CreateDataChannel
+              - ssmmessages:OpenControlChannel
+              - ssmmessages:OpenDataChannel
+            Resource: "*"
+
+  # ---- roles Ops owns outright ----------------------------------------------
+
+  # Used by the ECS agent (not the app) to pull the image and ship logs.
+  # Written out instead of using AmazonECSTaskExecutionRolePolicy, which
+  # allows every repo and log group in the account.
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-task-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: pull-and-log
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                # GetAuthorizationToken has no resource-level support.
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PullOwnImage
+                Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: !GetAtt Repository.Arn
+              - Sid: OwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${AppName}/*
+              - Sid: InjectOwnAppSecrets
+                Effect: Allow
+                # Lets a task definition inject ${AppName}/app/* secrets as env
+                # vars. The login secret (${AppName}/<env>/oidc) is NOT here: the
+                # app never sees it.
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AppName}/app/*
+
+  # CloudWatch/SSM-only instance role, for any EC2 instance the app runs.
+  # It is the replacement for SSH and RDP (both denied by the NACLs in
+  # Template 2): operators connect with Session Manager, and logs and metrics
+  # go to CloudWatch. Nothing else.
+  #
+  # "Unable to be modified by admin users" cannot be enforced from inside a
+  # template, since an admin can edit any role. Ops should protect
+  # role/*-instance with an SCP or an explicit Deny on the admin permission
+  # set. This template only ensures the role starts out clean.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-instance
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AppName}-instance
+      Roles: [!Ref InstanceRole]
+
+  # ---- CloudFormation execution role ----------------------------------------
+  # Split into four managed policies because together they exceed the 10 KB
+  # inline limit, and so a reviewer can read one concern at a time.
+
+  CfnExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-cfn-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudformation.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
+      ManagedPolicyArns:
+        - !Ref CfnExecNetworkPolicy
+        - !Ref CfnExecComputePolicy
+        - !Ref CfnExecEdgePolicy
+        - !Ref CfnExecIamPolicy
+
+  # VPC, subnets, NAT, NACLs and security groups (infra/app/network.yaml).
+  # Resource "*": EC2 create calls have no ARN until the resource exists.
+  # Next tightening once the stack is stable: require aws:ResourceTag/app on
+  # the modify and delete actions.
+  CfnExecNetworkPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AppName}-cfn-exec-network
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Network
+            Effect: Allow
+            Resource: "*"
+            Condition:
+              StringEquals: { aws:RequestedRegion: !Ref AWS::Region }
+            Action:
+              - ec2:DescribeAccountAttributes
+              - ec2:DescribeAddresses
+              - ec2:DescribeAddressesAttribute
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeManagedPrefixLists
+              - ec2:DescribeNatGateways
+              - ec2:DescribeNetworkAcls
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribePrefixLists
+              - ec2:DescribeRouteTables
+              - ec2:DescribeSecurityGroupRules
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeSubnets
+              - ec2:DescribeTags
+              - ec2:DescribeVpcAttribute
+              - ec2:DescribeVpcEndpoints
+              - ec2:DescribeVpcs
+              - ec2:GetManagedPrefixListEntries
+              - ec2:CreateVpc
+              - ec2:DeleteVpc
+              - ec2:ModifyVpcAttribute
+              - ec2:CreateSubnet
+              - ec2:DeleteSubnet
+              - ec2:ModifySubnetAttribute
+              - ec2:CreateInternetGateway
+              - ec2:DeleteInternetGateway
+              - ec2:AttachInternetGateway
+              - ec2:DetachInternetGateway
+              - ec2:CreateRouteTable
+              - ec2:DeleteRouteTable
+              - ec2:CreateRoute
+              - ec2:DeleteRoute
+              - ec2:ReplaceRoute
+              - ec2:AssociateRouteTable
+              - ec2:DisassociateRouteTable
+              - ec2:AllocateAddress
+              - ec2:ReleaseAddress
+              - ec2:CreateNatGateway
+              - ec2:DeleteNatGateway
+              - ec2:CreateNetworkAcl
+              - ec2:DeleteNetworkAcl
+              - ec2:CreateNetworkAclEntry
+              - ec2:DeleteNetworkAclEntry
+              - ec2:ReplaceNetworkAclEntry
+              - ec2:ReplaceNetworkAclAssociation
+              - ec2:CreateSecurityGroup
+              - ec2:DeleteSecurityGroup
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:AuthorizeSecurityGroupEgress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupEgress
+              - ec2:ModifySecurityGroupRules
+              - ec2:UpdateSecurityGroupRuleDescriptionsIngress
+              - ec2:UpdateSecurityGroupRuleDescriptionsEgress
+              - ec2:CreateManagedPrefixList
+              - ec2:ModifyManagedPrefixList
+              - ec2:DeleteManagedPrefixList
+              - ec2:CreateVpcEndpoint
+              - ec2:ModifyVpcEndpoint
+              - ec2:DeleteVpcEndpoints
+              - ec2:CreateTags
+              - ec2:DeleteTags
+
+  # ECS, load balancer and logs (infra/app/app.yaml), scoped by name prefix.
+  CfnExecComputePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AppName}-cfn-exec-compute
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EcsOwnResources
+            Effect: Allow
+            Action:
+              - ecs:CreateCluster
+              - ecs:DeleteCluster
+              - ecs:DescribeClusters
+              - ecs:UpdateCluster
+              - ecs:UpdateClusterSettings
+              - ecs:PutClusterCapacityProviders
+              - ecs:CreateService
+              - ecs:UpdateService
+              - ecs:DeleteService
+              - ecs:DescribeServices
+              - ecs:TagResource
+              - ecs:UntagResource
+              - ecs:ListTagsForResource
+            Resource:
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${AppName}-*
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${AppName}-*/*
+              - !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/${AppName}-*:*
+          - Sid: EcsTaskDefinitions
+            Effect: Allow
+            # Task definition registration has no resource-level support.
+            Action:
+              - ecs:RegisterTaskDefinition
+              - ecs:DeregisterTaskDefinition
+              - ecs:DescribeTaskDefinition
+            Resource: "*"
+            Condition:
+              StringEquals: { aws:RequestedRegion: !Ref AWS::Region }
+          - Sid: LoadBalancerOwnResources
+            Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateLoadBalancer
+              - elasticloadbalancing:DeleteLoadBalancer
+              - elasticloadbalancing:ModifyLoadBalancerAttributes
+              - elasticloadbalancing:SetSecurityGroups
+              - elasticloadbalancing:SetSubnets
+              - elasticloadbalancing:SetIpAddressType
+              - elasticloadbalancing:CreateTargetGroup
+              - elasticloadbalancing:DeleteTargetGroup
+              - elasticloadbalancing:ModifyTargetGroup
+              - elasticloadbalancing:ModifyTargetGroupAttributes
+              - elasticloadbalancing:CreateListener
+              - elasticloadbalancing:DeleteListener
+              - elasticloadbalancing:ModifyListener
+              - elasticloadbalancing:ModifyListenerAttributes
+              - elasticloadbalancing:AddListenerCertificates
+              - elasticloadbalancing:RemoveListenerCertificates
+              - elasticloadbalancing:CreateRule
+              - elasticloadbalancing:DeleteRule
+              - elasticloadbalancing:ModifyRule
+              - elasticloadbalancing:SetRulePriorities
+              - elasticloadbalancing:AddTags
+              - elasticloadbalancing:RemoveTags
+            Resource:
+              - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:loadbalancer/app/${AppName}-*/*
+              - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:targetgroup/${AppName}-*/*
+              - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener/app/${AppName}-*/*
+              - !Sub arn:aws:elasticloadbalancing:${AWS::Region}:${AWS::AccountId}:listener-rule/app/${AppName}-*/*
+          - Sid: LoadBalancerRead
+            Effect: Allow
+            # Describe calls have no resource-level support.
+            Action:
+              - elasticloadbalancing:DescribeListenerAttributes
+              - elasticloadbalancing:DescribeListenerCertificates
+              - elasticloadbalancing:DescribeListeners
+              - elasticloadbalancing:DescribeLoadBalancerAttributes
+              - elasticloadbalancing:DescribeLoadBalancers
+              - elasticloadbalancing:DescribeRules
+              - elasticloadbalancing:DescribeSSLPolicies
+              - elasticloadbalancing:DescribeTags
+              - elasticloadbalancing:DescribeTargetGroupAttributes
+              - elasticloadbalancing:DescribeTargetGroups
+              - elasticloadbalancing:DescribeTargetHealth
+            Resource: "*"
+            Condition:
+              StringEquals: { aws:RequestedRegion: !Ref AWS::Region }
+          - Sid: OwnLogGroups
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:DeleteLogGroup
+              - logs:PutRetentionPolicy
+              - logs:DeleteRetentionPolicy
+              - logs:TagResource
+              - logs:UntagResource
+              - logs:ListTagsForResource
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${AppName}/*
+          - Sid: LogGroupRead
+            Effect: Allow
+            # DescribeLogGroups has no resource-level support.
+            Action: logs:DescribeLogGroups
+            Resource: "*"
+          - Sid: PassTaskRolesToEcs
+            Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              - !GetAtt TaskExecutionRole.Arn
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-app-*
+            Condition:
+              StringEquals: { iam:PassedToService: ecs-tasks.amazonaws.com }
+          - Sid: PassInstanceRoleToEc2
+            Effect: Allow
+            Action: iam:PassRole
+            Resource: !GetAtt InstanceRole.Arn
+            Condition:
+              StringEquals: { iam:PassedToService: ec2.amazonaws.com }
+          - Sid: ServiceLinkedRolesOnFirstUse
+            Effect: Allow
+            # The first ECS cluster and load balancer in an account create
+            # these. Limited to exactly those two services.
+            Action: iam:CreateServiceLinkedRole
+            Resource: arn:aws:iam::*:role/aws-service-role/*
+            Condition:
+              StringEquals:
+                iam:AWSServiceName:
+                  - ecs.amazonaws.com
+                  - elasticloadbalancing.amazonaws.com
+
+  # Certificate, DNS record, and reading the login secret at deploy time.
+  CfnExecEdgePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AppName}-cfn-exec-edge
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RequestCertificates
+            Effect: Allow
+            # RequestCertificate has no ARN until the certificate exists.
+            Action: [acm:RequestCertificate, acm:AddTagsToCertificate, acm:ListCertificates]
+            Resource: "*"
+            Condition:
+              StringEquals: { aws:RequestedRegion: !Ref AWS::Region }
+          - Sid: ManageCertificates
+            Effect: Allow
+            Action:
+              - acm:DescribeCertificate
+              - acm:DeleteCertificate
+              - acm:ListTagsForCertificate
+              - acm:RemoveTagsFromCertificate
+            Resource: !Sub arn:aws:acm:${AWS::Region}:${AWS::AccountId}:certificate/*
+          - !If
+            - HasHostedZone
+            - Sid: OwnZoneRecords
+              Effect: Allow
+              # Only address and validation records, only in this one zone.
+              Action:
+                - route53:ChangeResourceRecordSets
+                - route53:ListResourceRecordSets
+                - route53:GetHostedZone
+              Resource: !Sub arn:aws:route53:::hostedzone/${HostedZoneId}
+              Condition:
+                ForAllValues:StringEquals:
+                  route53:ChangeResourceRecordSetsRecordTypes: [A, AAAA, CNAME]
+            - !Ref AWS::NoValue
+          - Sid: Route53ChangeStatus
+            Effect: Allow
+            Action: route53:GetChange
+            Resource: arn:aws:route53:::change/*
+          - Sid: ReadLoginSecretAtDeploy
+            Effect: Allow
+            # CloudFormation resolves {{resolve:secretsmanager:...}} with this
+            # role. The value goes straight into the listener config.
+            Action: [secretsmanager:GetSecretValue, secretsmanager:DescribeSecret]
+            Resource:
+              - !Ref OidcSecretStaging
+              - !Ref OidcSecretProd
+
+  # Roles the app creates itself in Template 2. See the header comment.
+  CfnExecIamPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AppName}-cfn-exec-iam
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CreateAppRolesOnlyWithBoundary
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:PutRolePermissionsBoundary
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-app-*
+            Condition:
+              StringEquals: { iam:PermissionsBoundary: !Ref WorkloadBoundary }
+          - Sid: ManageAppRoles
+            Effect: Allow
+            Action:
+              - iam:GetRole
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:ListRoleTags
+              - iam:ListInstanceProfilesForRole
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:UpdateRole
+              - iam:UpdateRoleDescription
+              - iam:UpdateAssumeRolePolicy
+              - iam:DeleteRole
+            Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/${AppName}-app-*
+          - Sid: NeverRemoveOrWeakenTheBoundary
+            Effect: Deny
+            Action:
+              - iam:DeleteRolePermissionsBoundary
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicy
+              - iam:DeletePolicyVersion
+              - iam:SetDefaultPolicyVersion
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/*
+              - !Ref WorkloadBoundary
+
+  # ---- GitHub deploy roles --------------------------------------------------
+  # Trust: the OIDC "sub" claim must name this repo AND the GitHub environment.
+  # Two forms are accepted because GitHub can issue either, depending on the
+  # org's OIDC settings: "repo:org/repo:..." and the immutable-ID form
+  # "repo:org@<id>/repo@<id>:...". An org name cannot contain "@", so the
+  # wildcard cannot match another org's repo.
+
+  DeployRoleStaging:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-gh-deploy-staging
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:staging
+                  - !Sub repo:${GitHubOrg}@*/${GitHubRepo}@*:environment:staging
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                # GetAuthorizationToken has no resource-level support.
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushOwnImage
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: !GetAtt Repository.Arn
+              - Sid: OwnStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-staging-network/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-staging-app/*
+              - Sid: TemplateChecks
+                Effect: Allow
+                # No resource-level support.
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: HandOverToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: cloudformation.amazonaws.com }
+              - Sid: OwnLoginSecret
+                Effect: Allow
+                # Write: the "Set OIDC client secret" workflow. Describe: the
+                # deploy looks up the current version id to pin it.
+                Action: [secretsmanager:PutSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Ref OidcSecretStaging
+
+  # Same as staging except: trusts only the "production" environment, touches
+  # only -prod stacks, and pulls but never pushes images, because production
+  # promotes the exact digest staging already ran.
+  DeployRoleProd:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AppName}-gh-deploy-prod
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubOrg}/${GitHubRepo}:environment:production
+                  - !Sub repo:${GitHubOrg}@*/${GitHubRepo}@*:environment:production
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: EcrAuth
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: VerifyPromotedImage
+                Effect: Allow
+                Action: [ecr:DescribeImages, ecr:BatchGetImage]
+                Resource: !GetAtt Repository.Arn
+              - Sid: OwnStacks
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-prod-network/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-prod-app/*
+              - Sid: TemplateChecks
+                Effect: Allow
+                Action: [cloudformation:ValidateTemplate, cloudformation:GetTemplateSummary]
+                Resource: "*"
+              - Sid: HandOverToCloudFormation
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnExecRole.Arn
+                Condition:
+                  StringEquals: { iam:PassedToService: cloudformation.amazonaws.com }
+              - Sid: OwnLoginSecret
+                Effect: Allow
+                Action: [secretsmanager:PutSecretValue, secretsmanager:DescribeSecret]
+                Resource: !Ref OidcSecretProd
+
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt Repository.RepositoryUri
+    Export: { Name: !Sub "${AppName}-RepositoryUri" }
+  WorkloadBoundaryArn:
+    Value: !Ref WorkloadBoundary
+    Export: { Name: !Sub "${AppName}-WorkloadBoundaryArn" }
+  TaskExecutionRoleArn:
+    Value: !GetAtt TaskExecutionRole.Arn
+    Export: { Name: !Sub "${AppName}-TaskExecutionRoleArn" }
+  InstanceProfileName:
+    Value: !Ref InstanceProfile
+    Export: { Name: !Sub "${AppName}-InstanceProfileName" }
+  CfnExecRoleArn:
+    Value: !GetAtt CfnExecRole.Arn
+  DeployRoleStagingArn:
+    Description: Assumed by the GitHub "staging" environment.
+    Value: !GetAtt DeployRoleStaging.Arn
+  DeployRoleProdArn:
+    Description: Assumed by the GitHub "production" environment.
+    Value: !GetAtt DeployRoleProd.Arn
+  OidcSecretStagingName:
+    Value: !Sub ${AppName}/staging/oidc
+  OidcSecretProdName:
+    Value: !Sub ${AppName}/prod/oidc

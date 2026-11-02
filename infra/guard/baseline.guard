@@ -1,0 +1,266 @@
+#
+# Company baseline for every CloudFormation template (Template 1 and 2).
+# CI runs these on every pull request, so a reviewer only has to look at
+# deliberate exceptions, not re-check the basics by hand.
+#
+# Each rule maps to one baseline requirement in infra/README.md. To make an
+# exception for a specific deployment, change the template AND explain it in
+# the pull request; changing this file needs an Ops review (CODEOWNERS).
+#
+
+# ---- least privilege: no "*" or "<service>:*" actions -----------------------
+
+let role_statements = Resources.*[
+    Type == 'AWS::IAM::Role'
+    Properties.Policies exists
+].Properties.Policies[*].PolicyDocument.Statement[*]
+
+let policy_statements = Resources.*[
+    Type in ['AWS::IAM::ManagedPolicy', 'AWS::IAM::Policy']
+].Properties.PolicyDocument.Statement[*]
+
+rule iam_role_no_wildcard_actions when %role_statements !empty {
+    %role_statements[ Effect == 'Allow' ] {
+        when Action is_string {
+            Action != /^\*$|:\*$/
+            <<Allow statements must list actions; "*" and "<service>:*" are not allowed.>>
+        }
+        when Action is_list {
+            Action[*] != /^\*$|:\*$/
+            <<Allow statements must list actions; "*" and "<service>:*" are not allowed.>>
+        }
+    }
+}
+
+rule iam_policy_no_wildcard_actions when %policy_statements !empty {
+    %policy_statements[ Effect == 'Allow' ] {
+        when Action is_string {
+            Action != /^\*$|:\*$/
+            <<Allow statements must list actions; "*" and "<service>:*" are not allowed.>>
+        }
+        when Action is_list {
+            Action[*] != /^\*$|:\*$/
+            <<Allow statements must list actions; "*" and "<service>:*" are not allowed.>>
+        }
+    }
+}
+
+# No long-lived credentials, ever. GitHub uses OIDC; people use SSO.
+let iam_users = Resources.*[ Type in ['AWS::IAM::User', 'AWS::IAM::AccessKey'] ]
+
+rule iam_no_users_or_keys {
+    %iam_users empty
+    <<IAM users and access keys are not allowed; use OIDC or SSO roles.>>
+}
+
+# ---- security groups: no ingress from anywhere --------------------------------
+
+let security_groups = Resources.*[ Type == 'AWS::EC2::SecurityGroup' ]
+
+rule sg_no_open_ingress when %security_groups !empty {
+    %security_groups.Properties {
+        when SecurityGroupIngress exists {
+            SecurityGroupIngress[*] {
+                when CidrIp exists {
+                    CidrIp != '0.0.0.0/0'
+                    <<No security group ingress from 0.0.0.0/0; use a prefix list or a source security group.>>
+                }
+                when CidrIpv6 exists {
+                    CidrIpv6 != '::/0'
+                    <<No security group ingress from ::/0.>>
+                }
+            }
+        }
+    }
+}
+
+let sg_ingress_rules = Resources.*[ Type == 'AWS::EC2::SecurityGroupIngress' ]
+
+rule sg_ingress_resource_not_open when %sg_ingress_rules !empty {
+    %sg_ingress_rules.Properties {
+        when CidrIp exists {
+            CidrIp != '0.0.0.0/0'
+            <<No security group ingress from 0.0.0.0/0.>>
+        }
+        when CidrIpv6 exists {
+            CidrIpv6 != '::/0'
+            <<No security group ingress from ::/0.>>
+        }
+    }
+}
+
+# Egress: a group with no egress rules silently gets allow-all to 0.0.0.0/0,
+# so every group must declare its egress, and 0.0.0.0/0 is allowed only on
+# 443 (identity provider, AWS APIs - none have fixed IPs).
+rule sg_declares_egress when %security_groups !empty {
+    %security_groups.Properties.SecurityGroupEgress exists
+    <<Declare SecurityGroupEgress explicitly; the default is allow-all to 0.0.0.0/0.>>
+}
+
+rule sg_open_egress_only_https when %security_groups !empty {
+    %security_groups.Properties {
+        when SecurityGroupEgress exists {
+            SecurityGroupEgress[*] {
+                when CidrIp exists {
+                    when CidrIp == '0.0.0.0/0' {
+                        IpProtocol == 'tcp'
+                        FromPort == 443
+                        ToPort == 443
+                        <<Egress to 0.0.0.0/0 is allowed on tcp/443 only.>>
+                    }
+                }
+            }
+        }
+    }
+}
+
+let sg_egress_rules = Resources.*[ Type == 'AWS::EC2::SecurityGroupEgress' ]
+
+rule sg_egress_resource_only_https when %sg_egress_rules !empty {
+    %sg_egress_rules.Properties {
+        when CidrIp exists {
+            when CidrIp == '0.0.0.0/0' {
+                IpProtocol == 'tcp'
+                FromPort == 443
+                ToPort == 443
+                <<Egress to 0.0.0.0/0 is allowed on tcp/443 only.>>
+            }
+        }
+    }
+}
+
+# ---- NACLs: deny SSH and RDP from anywhere -----------------------------------
+
+let nacls = Resources.*[ Type == 'AWS::EC2::NetworkAcl' ]
+
+let ssh_denies = Resources.*[
+    Type == 'AWS::EC2::NetworkAclEntry'
+    Properties.RuleAction == 'deny'
+    Properties.Egress == false
+    Properties.CidrBlock == '0.0.0.0/0'
+    Properties.PortRange.From == 22
+]
+
+let rdp_denies = Resources.*[
+    Type == 'AWS::EC2::NetworkAclEntry'
+    Properties.RuleAction == 'deny'
+    Properties.Egress == false
+    Properties.CidrBlock == '0.0.0.0/0'
+    Properties.PortRange.From == 3389
+]
+
+rule nacl_denies_ssh when %nacls !empty {
+    %ssh_denies !empty
+    <<Every template with NACLs must deny inbound 22/tcp from 0.0.0.0/0.>>
+}
+
+rule nacl_denies_rdp when %nacls !empty {
+    %rdp_denies !empty
+    <<Every template with NACLs must deny inbound 3389/tcp from 0.0.0.0/0.>>
+}
+
+# ---- EC2: IMDSv2 and encrypted EBS -------------------------------------------
+
+let launch_templates = Resources.*[ Type == 'AWS::EC2::LaunchTemplate' ]
+
+rule ec2_imdsv2_required when %launch_templates !empty {
+    %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpTokens == 'required'
+    <<Launch templates must require IMDSv2 (MetadataOptions.HttpTokens: required).>>
+}
+
+rule ec2_launch_template_ebs_encrypted when %launch_templates !empty {
+    %launch_templates.Properties.LaunchTemplateData {
+        when BlockDeviceMappings exists {
+            BlockDeviceMappings[*].Ebs.Encrypted == true
+            <<EBS volumes must be encrypted.>>
+        }
+    }
+}
+
+let instances = Resources.*[ Type == 'AWS::EC2::Instance' ]
+
+# AWS::EC2::Instance cannot set IMDSv2 by itself, so it must use a launch
+# template (which the rule above checks).
+rule ec2_instance_uses_launch_template when %instances !empty {
+    %instances.Properties.LaunchTemplate exists
+    <<EC2 instances must use a launch template so IMDSv2 can be enforced.>>
+}
+
+rule ec2_instance_ebs_encrypted when %instances !empty {
+    %instances.Properties {
+        when BlockDeviceMappings exists {
+            BlockDeviceMappings[*].Ebs.Encrypted == true
+            <<EBS volumes must be encrypted.>>
+        }
+    }
+}
+
+let volumes = Resources.*[ Type == 'AWS::EC2::Volume' ]
+
+rule ebs_volume_encrypted when %volumes !empty {
+    %volumes.Properties.Encrypted == true
+    <<EBS volumes must be encrypted.>>
+}
+
+# ---- RDS: encrypted and never public -----------------------------------------
+
+let db_instances = Resources.*[ Type == 'AWS::RDS::DBInstance' ]
+
+rule rds_instance_encrypted when %db_instances !empty {
+    %db_instances.Properties {
+        # Aurora instances inherit encryption from their cluster.
+        when DBClusterIdentifier !exists {
+            StorageEncrypted == true
+            <<RDS storage must be encrypted.>>
+        }
+    }
+}
+
+rule rds_instance_not_public when %db_instances !empty {
+    %db_instances.Properties.PubliclyAccessible == false
+    <<RDS instances must set PubliclyAccessible: false.>>
+}
+
+let db_clusters = Resources.*[ Type == 'AWS::RDS::DBCluster' ]
+
+rule rds_cluster_encrypted_private when %db_clusters !empty {
+    %db_clusters.Properties {
+        StorageEncrypted == true
+        <<RDS clusters must be encrypted.>>
+        when PubliclyAccessible exists {
+            PubliclyAccessible == false
+            <<RDS clusters must not be public.>>
+        }
+    }
+}
+
+# ---- ElastiCache: encrypted, and only in forms that can be -------------------
+
+let cache_groups = Resources.*[ Type == 'AWS::ElastiCache::ReplicationGroup' ]
+
+rule elasticache_encrypted when %cache_groups !empty {
+    %cache_groups.Properties {
+        AtRestEncryptionEnabled == true
+        TransitEncryptionEnabled == true
+        <<ElastiCache must be encrypted at rest and in transit.>>
+    }
+}
+
+let cache_clusters = Resources.*[ Type == 'AWS::ElastiCache::CacheCluster' ]
+
+rule elasticache_no_unencryptable_clusters {
+    %cache_clusters empty
+    <<Use AWS::ElastiCache::ReplicationGroup; CacheCluster cannot be encrypted.>>
+}
+
+# ---- load balancers: plain HTTP only redirects ---------------------------------
+
+let http_listeners = Resources.*[
+    Type == 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties.Protocol == 'HTTP'
+]
+
+rule alb_http_only_redirects when %http_listeners !empty {
+    %http_listeners.Properties.DefaultActions[*].Type == 'redirect'
+    <<HTTP listeners may only redirect to HTTPS.>>
+}

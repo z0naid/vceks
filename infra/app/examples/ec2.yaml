@@ -1,0 +1,85 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  EXAMPLE - one EC2 instance with the baseline defaults, for workloads that
+  cannot run on Fargate. Prefer Fargate: it has no instance to patch.
+
+# Before this can deploy, Template 1 must grant CfnExecRole the EC2 instance
+# and launch template actions it uses (an Ops review). The instance role
+# itself already exists in Template 1.
+#
+# Baseline defaults (see infra/README.md):
+#   - IMDSv2 required (HttpTokens: required), hop limit 1. IMDSv1 lets any
+#     SSRF bug in the app read the instance's credentials with one GET.
+#   - Every EBS volume encrypted. Also ask Ops to turn on EBS encryption by
+#     default for the account, so volumes created outside templates are too.
+#   - No key pair and no inbound rules. Access is SSM Session Manager through
+#     the CloudWatch/SSM-only instance role; SSH and RDP are denied by NACL.
+#   - Private subnet, no public IP.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+  NetworkStack:
+    Type: String
+  InstanceType:
+    Type: String
+    Default: t4g.small
+  ImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    # Latest Amazon Linux 2023 (arm64), which ships the SSM agent.
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+
+Resources:
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AppName}-${Environment} instance, no inbound
+      VpcId: { "Fn::ImportValue": !Sub "${NetworkStack}-VpcId" }
+      # No ingress at all. Session Manager connects outbound from the agent.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: SSM, CloudWatch, package repositories
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AppName}-${Environment}
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: { "Fn::ImportValue": !Sub "${AppName}-InstanceProfileName" }
+        SecurityGroupIds: [!Ref InstanceSecurityGroup]
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Select [0, !Split [",", { "Fn::ImportValue": !Sub "${NetworkStack}-PrivateSubnetIds" }]]
+      Tags:
+        - { Key: Name, Value: !Sub "${AppName}-${Environment}" }
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+    Description: Connect with `aws ssm start-session --target <id>`.

@@ -1,0 +1,118 @@
+name: Deploy one environment
+description: >-
+  Deploys <app>-<env>-network then <app>-<env>-app from infra/app/, using the
+  environment's GitHub deploy role and CloudFormation execution role from
+  Template 1. All non-secret settings come from infra/app/config.json.
+
+inputs:
+  environment:
+    description: staging or prod (the key in infra/app/config.json)
+    required: true
+  image-uri:
+    description: Image pinned by digest (...@sha256:...)
+    required: true
+
+outputs:
+  url:
+    description: The app's URL
+    value: ${{ steps.outputs.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Load config
+      id: config
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment }}
+      run: |
+        set -euo pipefail
+        CFG=infra/app/config.json
+        if grep -q REPLACE_ME "$CFG"; then
+          echo "::error file=$CFG::Fill in every REPLACE_ME value before deploying."
+          exit 1
+        fi
+        APP=$(jq -r .appName "$CFG")
+        ACCOUNT=$(jq -r .awsAccountId "$CFG")
+        {
+          echo "app=$APP"
+          echo "region=$(jq -r .awsRegion "$CFG")"
+          echo "deploy_role=arn:aws:iam::$ACCOUNT:role/$APP-gh-deploy-$ENV_NAME"
+          echo "cfn_role=arn:aws:iam::$ACCOUNT:role/$APP-cfn-exec"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Assume deploy role (OIDC, no keys)
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ steps.config.outputs.deploy_role }}
+        aws-region: ${{ steps.config.outputs.region }}
+
+    - name: Deploy network stack
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment }}
+        APP: ${{ steps.config.outputs.app }}
+        CFN_ROLE: ${{ steps.config.outputs.cfn_role }}
+      run: |
+        set -euo pipefail
+        mapfile -t PARAMS < <(jq -r --arg e "$ENV_NAME" \
+          '.environments[$e].network | to_entries[] | "\(.key)=\(.value)"' infra/app/config.json)
+        aws cloudformation deploy \
+          --stack-name "$APP-$ENV_NAME-network" \
+          --template-file infra/app/network.yaml \
+          --role-arn "$CFN_ROLE" \
+          --no-fail-on-empty-changeset \
+          --tags app="$APP" environment="$ENV_NAME" \
+          --parameter-overrides AppName="$APP" Environment="$ENV_NAME" "${PARAMS[@]}"
+
+    - name: Deploy app stack
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment }}
+        APP: ${{ steps.config.outputs.app }}
+        CFN_ROLE: ${{ steps.config.outputs.cfn_role }}
+        IMAGE_URI: ${{ inputs.image-uri }}
+      run: |
+        set -euo pipefail
+        mapfile -t PARAMS < <(jq -r --arg e "$ENV_NAME" \
+          '.environments[$e].app | to_entries[] | "\(.key)=\(.value)"' infra/app/config.json)
+        # Pin the login secret's current version so a rotated secret is picked
+        # up by the listener (CloudFormation cannot see secret value changes).
+        SECRET_VERSION=$(aws secretsmanager describe-secret --secret-id "$APP/$ENV_NAME/oidc" --output json \
+          | jq -r '.VersionIdsToStages | to_entries[] | select(.value | index("AWSCURRENT")) | .key')
+        aws cloudformation deploy \
+          --stack-name "$APP-$ENV_NAME-app" \
+          --template-file infra/app/app.yaml \
+          --role-arn "$CFN_ROLE" \
+          --capabilities CAPABILITY_NAMED_IAM \
+          --no-fail-on-empty-changeset \
+          --tags app="$APP" environment="$ENV_NAME" \
+          --parameter-overrides \
+            AppName="$APP" Environment="$ENV_NAME" \
+            NetworkStack="$APP-$ENV_NAME-network" \
+            ImageUri="$IMAGE_URI" \
+            OidcSecretVersionId="$SECRET_VERSION" \
+            "${PARAMS[@]}"
+
+    - name: Report
+      id: outputs
+      shell: bash
+      env:
+        ENV_NAME: ${{ inputs.environment }}
+        APP: ${{ steps.config.outputs.app }}
+        IMAGE_URI: ${{ inputs.image-uri }}
+      run: |
+        set -euo pipefail
+        URL=$(aws cloudformation describe-stacks --stack-name "$APP-$ENV_NAME-app" \
+          --query "Stacks[0].Outputs[?OutputKey=='Url'].OutputValue" --output text)
+        echo "url=$URL" >> "$GITHUB_OUTPUT"
+        {
+          echo "### $ENV_NAME deployed"
+          echo ""
+          echo "| | |"
+          echo "|---|---|"
+          echo "| App | $URL |"
+          echo "| Who am I | $URL/whoami |"
+          echo "| Health | $URL/api/health |"
+          echo "| Image | \`$IMAGE_URI\` |"
+        } >> "$GITHUB_STEP_SUMMARY"

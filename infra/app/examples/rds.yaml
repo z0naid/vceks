@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  EXAMPLE - PostgreSQL on RDS with the baseline defaults. Copy into app.yaml
+  (or deploy as its own <app>-<env>-db stack) when the app needs a database.
+
+# Before this can deploy, Template 1 must grant CfnExecRole the rds:* actions
+# it uses (an Ops review), because the database is a new service for the app.
+#
+# Baseline defaults (see infra/README.md):
+#   - StorageEncrypted: true. Encryption cannot be added to an existing
+#     instance later without a snapshot-and-restore, so it starts on.
+#   - PubliclyAccessible: false, in private subnets only, reachable only from
+#     the app's task security group.
+#   - No password in the template or the app: RDS manages the master password
+#     in Secrets Manager, and the app connects with IAM database auth.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+  NetworkStack:
+    Type: String
+  AppStack:
+    Type: String
+    Description: The <app>-<env>-app stack; its task security group is the only allowed client.
+  InstanceClass:
+    Type: String
+    Default: db.t4g.micro
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub ${AppName}-${Environment} private subnets
+      SubnetIds: !Split [",", { "Fn::ImportValue": !Sub "${NetworkStack}-PrivateSubnetIds" }]
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AppName}-${Environment} database, app tasks only
+      VpcId: { "Fn::ImportValue": !Sub "${NetworkStack}-VpcId" }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: { "Fn::ImportValue": !Sub "${AppStack}-TaskSecurityGroupId" }
+      # A database starts no outbound connections. Without an explicit rule
+      # the group would get the default allow-all egress, so this placeholder
+      # (loopback only) replaces it.
+      SecurityGroupEgress:
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32, Description: no egress }
+
+  # The task security group only allows 443 out; open the database port too.
+  TasksToDb:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: { "Fn::ImportValue": !Sub "${AppStack}-TaskSecurityGroupId" }
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DbSecurityGroup
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${AppName}-${Environment}
+      Engine: postgres
+      EngineVersion: "18"
+      DBInstanceClass: !Ref InstanceClass
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      MasterUsername: app_admin
+      ManageMasterUserPassword: true
+      # The app's task role gets rds-db:connect (allowed by the workload
+      # boundary) instead of a password.
+      EnableIAMDatabaseAuthentication: true
+      MultiAZ: !If [IsProd, true, false]
+      BackupRetentionPeriod: !If [IsProd, 14, 3]
+      DeletionProtection: !If [IsProd, true, false]
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      # RDS for PostgreSQL 15+ already defaults rds.force_ssl to 1, so
+      # connections without TLS are refused.
+
+Outputs:
+  Endpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  MasterSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn

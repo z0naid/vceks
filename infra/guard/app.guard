@@ -1,0 +1,49 @@
+#
+# Extra rules for Template 2 (infra/app/**) only. These are what make it safe
+# to let developers create IAM roles without an Ops review. CfnExecRole in
+# Template 1 enforces the same things at deploy time; these rules catch them
+# at pull-request time, with a readable message.
+#
+
+let app_roles = Resources.*[ Type == 'AWS::IAM::Role' ]
+
+# Without the boundary, CfnExecRole refuses to create the role anyway; this
+# just fails earlier and explains why.
+rule app_roles_have_boundary when %app_roles !empty {
+    %app_roles.Properties {
+        PermissionsBoundary exists
+        <<App roles must set PermissionsBoundary to the <app>-WorkloadBoundaryArn export.>>
+        RoleName exists
+        <<App roles must have an explicit RoleName starting with <app>-app-.>>
+    }
+}
+
+# The boundary caps what a role can do, not who can assume it. A role that
+# trusts another AWS account or a web identity would hand the app's
+# permissions to someone outside it, so app roles may trust AWS services only.
+rule app_roles_trust_only_services when %app_roles !empty {
+    %app_roles.Properties.AssumeRolePolicyDocument.Statement[*] {
+        Principal.Service exists
+        Principal.AWS !exists
+        Principal.Federated !exists
+        <<App roles may only be assumed by AWS services (e.g. ecs-tasks.amazonaws.com).>>
+    }
+}
+
+# Policies, users and groups belong in Template 1.
+let app_other_iam = Resources.*[
+    Type in ['AWS::IAM::ManagedPolicy', 'AWS::IAM::Policy', 'AWS::IAM::User',
+             'AWS::IAM::Group', 'AWS::IAM::AccessKey', 'AWS::IAM::InstanceProfile']
+]
+
+rule app_no_other_iam {
+    %app_other_iam empty
+    <<Only AWS::IAM::Role (with inline policies) may be created in Template 2.>>
+}
+
+let services = Resources.*[ Type == 'AWS::ECS::Service' ]
+
+rule ecs_tasks_private when %services !empty {
+    %services.Properties.NetworkConfiguration.AwsvpcConfiguration.AssignPublicIp == 'DISABLED'
+    <<ECS tasks run in private subnets without public IPs.>>
+}

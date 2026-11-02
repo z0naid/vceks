@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  EXAMPLE - Redis-compatible cache on ElastiCache with the baseline defaults.
+  Copy into app.yaml (or deploy as its own <app>-<env>-cache stack).
+
+# Before this can deploy, Template 1 must grant CfnExecRole the elasticache
+# actions it uses (an Ops review).
+#
+# Baseline defaults (see infra/README.md):
+#   - Encrypted at rest and in transit, with TLS required for every client.
+#     Neither can be switched on later without replacing the cluster.
+#   - Private subnets only, reachable only from the app's task security group.
+#     ElastiCache has no public endpoint option at all; the subnet group is
+#     what keeps it private.
+#   - A replication group, never AWS::ElastiCache::CacheCluster, which cannot
+#     encrypt.
+
+Parameters:
+  AppName:
+    Type: String
+    AllowedPattern: "^[a-z][a-z0-9-]{1,19}$"
+  Environment:
+    Type: String
+    AllowedValues: [staging, prod]
+  NetworkStack:
+    Type: String
+  AppStack:
+    Type: String
+  NodeType:
+    Type: String
+    Default: cache.t4g.micro
+
+Resources:
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: !Sub ${AppName}-${Environment} private subnets
+      SubnetIds: !Split [",", { "Fn::ImportValue": !Sub "${NetworkStack}-PrivateSubnetIds" }]
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AppName}-${Environment} cache, app tasks only
+      VpcId: { "Fn::ImportValue": !Sub "${NetworkStack}-VpcId" }
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: { "Fn::ImportValue": !Sub "${AppStack}-TaskSecurityGroupId" }
+      # Replaces the default allow-all egress; a cache starts no connections.
+      SecurityGroupEgress:
+        - { IpProtocol: icmp, FromPort: -1, ToPort: -1, CidrIp: 127.0.0.1/32, Description: no egress }
+
+  TasksToCache:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: { "Fn::ImportValue": !Sub "${AppStack}-TaskSecurityGroupId" }
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref CacheSecurityGroup
+
+  Cache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${AppName}-${Environment}
+      ReplicationGroupDescription: !Sub ${AppName}-${Environment} cache
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: !Ref NodeType
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      TransitEncryptionMode: required
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!Ref CacheSecurityGroup]
+      # For authentication beyond network isolation, add a UserGroupIds entry
+      # with IAM-authenticated users rather than a shared AuthToken.
+
+Outputs:
+  PrimaryEndpoint:
+    Value: !GetAtt Cache.PrimaryEndPoint.Address
